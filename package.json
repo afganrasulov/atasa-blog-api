@@ -1,0 +1,16 @@
+{
+  "name": "atasa-blog-api",
+  "version": "1.0.0",
+  "description": "Blog API for Atasa Danismanlik",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1"
+  }
+}
