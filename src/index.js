@@ -10,6 +10,9 @@ const PORT = process.env.PORT || 3000;
 // Audio Processor Service URL
 const AUDIO_PROCESSOR_URL = process.env.AUDIO_PROCESSOR_URL || 'http://localhost:3001';
 
+// YouTube API URL
+const YT_API = 'https://www.googleapis.com/youtube/v3';
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
@@ -33,8 +36,15 @@ async function initDB() {
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS blog_post_id INTEGER`);
     await pool.query(`ALTER TABLE posts ADD COLUMN IF NOT EXISTS video_id VARCHAR(50)`);
     
+    // Default settings
     await pool.query(`INSERT INTO settings (key, value) VALUES ('autopilot', 'false') ON CONFLICT (key) DO NOTHING`);
     await pool.query(`INSERT INTO settings (key, value) VALUES ('transcription_provider', 'openai') ON CONFLICT (key) DO NOTHING`);
+    await pool.query(`INSERT INTO settings (key, value) VALUES ('auto_scan_enabled', 'false') ON CONFLICT (key) DO NOTHING`);
+    await pool.query(`INSERT INTO settings (key, value) VALUES ('auto_transcribe', 'false') ON CONFLICT (key) DO NOTHING`);
+    await pool.query(`INSERT INTO settings (key, value) VALUES ('auto_blog', 'false') ON CONFLICT (key) DO NOTHING`);
+    await pool.query(`INSERT INTO settings (key, value) VALUES ('auto_publish', 'false') ON CONFLICT (key) DO NOTHING`);
+    await pool.query(`INSERT INTO settings (key, value) VALUES ('scan_interval_hours', '6') ON CONFLICT (key) DO NOTHING`);
+    await pool.query(`INSERT INTO settings (key, value) VALUES ('last_scan_time', '') ON CONFLICT (key) DO NOTHING`);
     await pool.query(`INSERT INTO allowed_users (email, name) VALUES ('afganrasulov@gmail.com', 'Afgan Rasulov') ON CONFLICT (email) DO NOTHING`);
     console.log('✅ Database initialized');
   } catch (error) { console.error('Database init error:', error); }
@@ -46,13 +56,286 @@ function generateSlug(title) {
 function formatDateTR() { return new Date().toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', year: 'numeric' }); }
 function calculateReadTime(content) { return Math.ceil(content.split(' ').length / 200) + ' dk okuma'; }
 
-// Scheduled posts check
+function parseDuration(d) {
+  const m = d.match(/PT(\d+H)?(\d+M)?(\d+S)?/);
+  return (parseInt(m?.[1]) || 0) * 3600 + (parseInt(m?.[2]) || 0) * 60 + (parseInt(m?.[3]) || 0);
+}
+
+// Helper to get setting value
+async function getSetting(key) {
+  const result = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
+  return result.rows[0]?.value || null;
+}
+
+// =====================
+// CRON JOB - Auto Video Scanner
+// =====================
+async function autoScanVideos() {
+  try {
+    const autoScanEnabled = await getSetting('auto_scan_enabled');
+    if (autoScanEnabled !== 'true') return;
+    
+    const youtubeApiKey = await getSetting('youtube_api_key');
+    const channelId = await getSetting('channel_id');
+    
+    if (!youtubeApiKey) {
+      console.log('⚠️ Auto-scan skipped: No YouTube API key configured');
+      return;
+    }
+    
+    console.log('🔄 Starting auto video scan...');
+    
+    // Get channel ID if not set
+    let activeChannelId = channelId;
+    if (!activeChannelId) {
+      const ch = await fetch(`${YT_API}/search?part=snippet&type=channel&q=@atasa_tr&key=${youtubeApiKey}`).then(r => r.json());
+      if (ch.items?.[0]) {
+        activeChannelId = ch.items[0].snippet.channelId;
+        await pool.query(`INSERT INTO settings (key, value) VALUES ('channel_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [activeChannelId]);
+      }
+    }
+    
+    if (!activeChannelId) {
+      console.log('⚠️ Auto-scan failed: Could not determine channel ID');
+      return;
+    }
+    
+    // Fetch last 50 videos
+    let allVideos = [];
+    let pageToken = null;
+    
+    for (let page = 0; page < 2; page++) { // 2 pages = 100 videos max
+      let searchUrl = `${YT_API}/search?part=snippet&channelId=${activeChannelId}&maxResults=50&order=date&type=video&key=${youtubeApiKey}`;
+      if (pageToken) searchUrl += `&pageToken=${pageToken}`;
+      
+      const search = await fetch(searchUrl).then(r => r.json());
+      if (!search.items?.length) break;
+      
+      const ids = search.items.map(i => i.id.videoId).join(',');
+      const details = await fetch(`${YT_API}/videos?part=contentDetails,statistics&id=${ids}&key=${youtubeApiKey}`).then(r => r.json());
+      
+      const videos = search.items.map(i => {
+        const d = details.items.find(x => x.id === i.id.videoId);
+        const dur = parseDuration(d?.contentDetails?.duration || 'PT0S');
+        return {
+          id: i.id.videoId,
+          title: i.snippet.title,
+          description: i.snippet.description,
+          thumbnail: i.snippet.thumbnails.high?.url,
+          duration: dur,
+          viewCount: parseInt(d?.statistics?.viewCount || 0),
+          publishedAt: i.snippet.publishedAt,
+          channelId: activeChannelId,
+          type: dur <= 60 ? 'short' : 'video'
+        };
+      });
+      
+      allVideos = allVideos.concat(videos);
+      pageToken = search.nextPageToken;
+      if (!pageToken) break;
+    }
+    
+    // Find new videos (not in database)
+    const existingIds = (await pool.query('SELECT id FROM youtube_videos')).rows.map(r => r.id);
+    const newVideos = allVideos.filter(v => !existingIds.includes(v.id));
+    
+    if (newVideos.length === 0) {
+      console.log('✅ Auto-scan complete: No new videos found');
+      await pool.query(`INSERT INTO settings (key, value) VALUES ('last_scan_time', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [new Date().toISOString()]);
+      return;
+    }
+    
+    // Save new videos
+    for (const video of newVideos) {
+      await pool.query(`INSERT INTO youtube_videos (id, title, description, thumbnail, duration, view_count, published_at, channel_id, video_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO NOTHING`,
+        [video.id, video.title, video.description, video.thumbnail, video.duration, video.viewCount, video.publishedAt, video.channelId, video.type]);
+    }
+    
+    console.log(`✅ Auto-scan complete: ${newVideos.length} new videos found`);
+    await pool.query(`INSERT INTO settings (key, value) VALUES ('last_scan_time', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [new Date().toISOString()]);
+    
+    // Auto transcribe if enabled
+    const autoTranscribe = await getSetting('auto_transcribe');
+    if (autoTranscribe === 'true') {
+      const openaiApiKey = await getSetting('openai_api_key');
+      if (openaiApiKey) {
+        for (const video of newVideos) {
+          console.log(`🎙️ Auto-transcribing: ${video.title}`);
+          await startTranscription(video.id, openaiApiKey, 'openai');
+        }
+      } else {
+        console.log('⚠️ Auto-transcribe skipped: No OpenAI API key');
+      }
+    }
+    
+  } catch (error) {
+    console.error('❌ Auto-scan error:', error.message);
+  }
+}
+
+// Start transcription for a video (internal function)
+async function startTranscription(videoId, apiKey, provider = 'openai') {
+  try {
+    await pool.query(`UPDATE youtube_videos SET transcript_status = 'processing', audio_status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
+    
+    const transcribeResponse = await fetch(`${AUDIO_PROCESSOR_URL}/transcribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ videoId, provider, apiKey, language: 'tr' })
+    });
+    
+    const transcribeData = await transcribeResponse.json();
+    if (!transcribeData.success) throw new Error(transcribeData.error || 'Transcription request failed');
+    
+    const jobId = transcribeData.jobId;
+    await pool.query(`UPDATE youtube_videos SET transcript_job_id = $1 WHERE id = $2`, [jobId, videoId]);
+    
+    // Poll for result
+    let completed = false;
+    let attempts = 0;
+    
+    while (!completed && attempts < 120) {
+      await new Promise(r => setTimeout(r, 5000));
+      attempts++;
+      
+      const statusResponse = await fetch(`${AUDIO_PROCESSOR_URL}/status/${jobId}`);
+      const statusData = await statusResponse.json();
+      
+      if (statusData.status === 'completed') {
+        completed = true;
+        await pool.query(`UPDATE youtube_videos SET audio_status = 'completed', transcript = $1, transcript_status = 'completed', transcript_model = $2, transcript_updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+          [statusData.transcript, provider, videoId]);
+        console.log(`✅ Transcription completed for ${videoId}`);
+        
+        // Check for auto blog creation
+        await checkAutoBlogCreation(videoId);
+        
+      } else if (statusData.status === 'failed') {
+        throw new Error(statusData.error || 'Transcription failed');
+      } else if (statusData.status === 'transcribing') {
+        await pool.query(`UPDATE youtube_videos SET audio_status = 'completed' WHERE id = $1`, [videoId]);
+      }
+    }
+    
+    if (!completed) throw new Error('Transcription timeout');
+    
+  } catch (error) {
+    console.error(`❌ Transcription failed for ${videoId}:`, error.message);
+    await pool.query(`UPDATE youtube_videos SET transcript_status = 'failed', audio_status = CASE WHEN audio_status = 'processing' THEN 'failed' ELSE audio_status END, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
+  }
+}
+
+// Check if auto blog creation is enabled and create blog
+async function checkAutoBlogCreation(videoId) {
+  try {
+    const autoBlog = await getSetting('auto_blog');
+    if (autoBlog !== 'true') return;
+    
+    const openaiApiKey = await getSetting('openai_api_key');
+    if (!openaiApiKey) {
+      console.log('⚠️ Auto-blog skipped: No OpenAI API key');
+      return;
+    }
+    
+    // Get video data
+    const videoResult = await pool.query('SELECT * FROM youtube_videos WHERE id = $1', [videoId]);
+    if (videoResult.rows.length === 0) return;
+    
+    const video = videoResult.rows[0];
+    if (!video.transcript || video.blog_created) return;
+    
+    console.log(`📝 Auto-creating blog for: ${video.title}`);
+    
+    // Get blog prompt and SEO rules
+    const blogPrompt = await getSetting('blog_prompt') || getDefaultBlogPrompt();
+    const seoRules = await getSetting('ai_seo_rules') || '';
+    const systemPrompt = seoRules ? `${blogPrompt}\n\n--- AI SEO KURALLARI ---\n${seoRules}` : blogPrompt;
+    
+    // Generate blog content
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json', 
+        'Authorization': `Bearer ${openaiApiKey}` 
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Video Başlığı: ${video.title}\n\nTranskript:\n${video.transcript}` }
+        ],
+        temperature: 0.7,
+        max_tokens: 3500
+      })
+    });
+    
+    const data = await res.json();
+    if (data.error) throw new Error(data.error.message);
+    
+    const content = data.choices[0].message.content;
+    const titleMatch = content.match(/BAŞLIK:\s*(.+)/);
+    const blogTitle = titleMatch ? titleMatch[1].trim() : video.title;
+    const blogContent = content.replace(/BAŞLIK:\s*.+\n---\n?/, '').trim();
+    
+    // Check auto publish setting
+    const autoPublish = await getSetting('auto_publish');
+    const postStatus = autoPublish === 'true' ? 'published' : 'draft';
+    
+    // Save blog post
+    const slug = generateSlug(blogTitle) + '-' + Date.now();
+    const postResult = await pool.query(
+      `INSERT INTO posts (title, slug, content, category, excerpt, thumbnail, date, read_time, status, published_at, video_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [blogTitle, slug, blogContent, video.video_type === 'short' ? 'Shorts' : 'YouTube', blogContent.substring(0, 150) + '...', video.thumbnail, formatDateTR(), calculateReadTime(blogContent), postStatus, postStatus === 'published' ? new Date() : null, videoId]
+    );
+    
+    // Mark video as blog created
+    await pool.query(`UPDATE youtube_videos SET blog_created = TRUE, blog_post_id = $1 WHERE id = $2`, [postResult.rows[0].id, videoId]);
+    
+    console.log(`✅ Auto-blog created: ${blogTitle} (${postStatus})`);
+    
+  } catch (error) {
+    console.error(`❌ Auto-blog creation failed for ${videoId}:`, error.message);
+  }
+}
+
+function getDefaultBlogPrompt() {
+  return `Sen bir blog yazarısın. Verilen video transkriptini kullanarak SEO uyumlu, akıcı bir blog yazısı oluştur.
+
+Kurallar:
+- Başlığı "BAŞLIK: [başlık]" formatında yaz, ardından "---" koy
+- İçerik en az 500 kelime olmalı
+- Paragraflar halinde yaz, başlık kullanma
+- Doğal ve akıcı bir dil kullan
+- Video transkriptindeki bilgileri düzenle ve zenginleştir`;
+}
+
+// Scheduled posts check (every minute)
 setInterval(async () => {
   try {
     const result = await pool.query(`UPDATE posts SET status = 'published', published_at = CURRENT_TIMESTAMP, date = $1 WHERE status = 'scheduled' AND scheduled_at <= CURRENT_TIMESTAMP RETURNING title`, [formatDateTR()]);
     result.rows.forEach(post => console.log(`📅 Published: ${post.title}`));
   } catch (error) { console.error('Schedule check error:', error); }
 }, 60000);
+
+// Auto scan check (every hour, respects scan_interval_hours setting)
+setInterval(async () => {
+  try {
+    const autoScanEnabled = await getSetting('auto_scan_enabled');
+    if (autoScanEnabled !== 'true') return;
+    
+    const lastScanTime = await getSetting('last_scan_time');
+    const scanIntervalHours = parseInt(await getSetting('scan_interval_hours') || '6');
+    
+    if (lastScanTime) {
+      const hoursSinceLastScan = (Date.now() - new Date(lastScanTime).getTime()) / (1000 * 60 * 60);
+      if (hoursSinceLastScan < scanIntervalHours) return;
+    }
+    
+    await autoScanVideos();
+  } catch (error) {
+    console.error('Auto-scan check error:', error);
+  }
+}, 60 * 60 * 1000); // Check every hour
 
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'Atasa Blog API', audioProcessor: AUDIO_PROCESSOR_URL }));
 
@@ -131,6 +414,14 @@ app.post('/api/youtube/videos/reclassify', async (req, res) => {
   } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Manual trigger for auto scan
+app.post('/api/youtube/scan', async (req, res) => {
+  try {
+    res.json({ success: true, message: 'Scan started' });
+    await autoScanVideos();
+  } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 app.get('/api/youtube/videos/:id', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM youtube_videos WHERE id = $1', [req.params.id]);
@@ -172,77 +463,14 @@ app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
     // Get provider from settings if not provided
     let transcriptionProvider = provider;
     if (!transcriptionProvider) {
-      const settingsResult = await pool.query("SELECT value FROM settings WHERE key = 'transcription_provider'");
-      transcriptionProvider = settingsResult.rows[0]?.value || 'openai';
+      transcriptionProvider = await getSetting('transcription_provider') || 'openai';
     }
     
-    await pool.query(`UPDATE youtube_videos SET transcript_status = 'processing', audio_status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
     res.json({ success: true, status: 'processing', provider: transcriptionProvider });
     
-    // Call Audio Processor Service
-    (async () => {
-      try {
-        console.log(`🎙️ Starting transcription for ${videoId} with ${transcriptionProvider}...`);
-        
-        const transcribeResponse = await fetch(`${AUDIO_PROCESSOR_URL}/transcribe`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            videoId,
-            provider: transcriptionProvider,
-            apiKey,
-            language: 'tr'
-          })
-        });
-        
-        const transcribeData = await transcribeResponse.json();
-        if (!transcribeData.success) throw new Error(transcribeData.error || 'Transcription request failed');
-        
-        const jobId = transcribeData.jobId;
-        await pool.query(`UPDATE youtube_videos SET transcript_job_id = $1 WHERE id = $2`, [jobId, videoId]);
-        
-        console.log(`📝 Job started: ${jobId}`);
-        
-        // Poll for result
-        let completed = false;
-        let attempts = 0;
-        const maxAttempts = 120;
-        
-        while (!completed && attempts < maxAttempts) {
-          await new Promise(r => setTimeout(r, 5000));
-          attempts++;
-          
-          const statusResponse = await fetch(`${AUDIO_PROCESSOR_URL}/status/${jobId}`);
-          const statusData = await statusResponse.json();
-          
-          if (statusData.status === 'completed') {
-            completed = true;
-            await pool.query(`UPDATE youtube_videos SET audio_status = 'completed' WHERE id = $1`, [videoId]);
-            await pool.query(
-              `UPDATE youtube_videos SET transcript = $1, transcript_status = 'completed', transcript_model = $2, transcript_updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
-              [statusData.transcript, transcriptionProvider, videoId]
-            );
-            console.log(`✅ Transcription completed for ${videoId}`);
-          } else if (statusData.status === 'failed') {
-            throw new Error(statusData.error || 'Transcription failed');
-          } else if (statusData.status === 'extracting') {
-            if (attempts % 6 === 0) console.log(`Extracting audio... (${attempts * 5}s)`);
-          } else if (statusData.status === 'transcribing') {
-            await pool.query(`UPDATE youtube_videos SET audio_status = 'completed' WHERE id = $1`, [videoId]);
-            if (attempts % 6 === 0) console.log(`Transcribing... (${attempts * 5}s)`);
-          }
-        }
-        
-        if (!completed) throw new Error('Transcription timeout');
-        
-      } catch (error) {
-        console.error(`❌ Transcription failed for ${videoId}:`, error.message);
-        await pool.query(
-          `UPDATE youtube_videos SET transcript_status = 'failed', audio_status = CASE WHEN audio_status = 'processing' THEN 'failed' ELSE audio_status END, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-          [videoId]
-        );
-      }
-    })();
+    // Start transcription in background
+    startTranscription(videoId, apiKey, transcriptionProvider);
+    
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -257,59 +485,12 @@ app.post('/api/youtube/videos/bulk-transcribe', async (req, res) => {
     
     let transcriptionProvider = provider;
     if (!transcriptionProvider) {
-      const settingsResult = await pool.query("SELECT value FROM settings WHERE key = 'transcription_provider'");
-      transcriptionProvider = settingsResult.rows[0]?.value || 'openai';
+      transcriptionProvider = await getSetting('transcription_provider') || 'openai';
     }
     
     // Start transcription for each video
     for (const videoId of videoIds) {
-      await pool.query(`UPDATE youtube_videos SET transcript_status = 'processing', audio_status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
-      
-      // Fire and forget - each transcription runs in background
-      (async () => {
-        try {
-          console.log(`🎙️ Bulk: Starting transcription for ${videoId}...`);
-          
-          const transcribeResponse = await fetch(`${AUDIO_PROCESSOR_URL}/transcribe`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ videoId, provider: transcriptionProvider, apiKey, language: 'tr' })
-          });
-          
-          const transcribeData = await transcribeResponse.json();
-          if (!transcribeData.success) throw new Error(transcribeData.error);
-          
-          const jobId = transcribeData.jobId;
-          await pool.query(`UPDATE youtube_videos SET transcript_job_id = $1 WHERE id = $2`, [jobId, videoId]);
-          
-          // Poll for result
-          let completed = false;
-          let attempts = 0;
-          
-          while (!completed && attempts < 120) {
-            await new Promise(r => setTimeout(r, 5000));
-            attempts++;
-            
-            const statusResponse = await fetch(`${AUDIO_PROCESSOR_URL}/status/${jobId}`);
-            const statusData = await statusResponse.json();
-            
-            if (statusData.status === 'completed') {
-              completed = true;
-              await pool.query(`UPDATE youtube_videos SET audio_status = 'completed', transcript = $1, transcript_status = 'completed', transcript_model = $2, transcript_updated_at = CURRENT_TIMESTAMP WHERE id = $3`, [statusData.transcript, transcriptionProvider, videoId]);
-              console.log(`✅ Bulk: Transcription completed for ${videoId}`);
-            } else if (statusData.status === 'failed') {
-              throw new Error(statusData.error);
-            } else if (statusData.status === 'transcribing') {
-              await pool.query(`UPDATE youtube_videos SET audio_status = 'completed' WHERE id = $1`, [videoId]);
-            }
-          }
-          
-          if (!completed) throw new Error('Timeout');
-        } catch (error) {
-          console.error(`❌ Bulk: Failed for ${videoId}:`, error.message);
-          await pool.query(`UPDATE youtube_videos SET transcript_status = 'failed', audio_status = CASE WHEN audio_status = 'processing' THEN 'failed' ELSE audio_status END WHERE id = $1`, [videoId]);
-        }
-      })();
+      startTranscription(videoId, apiKey, transcriptionProvider);
     }
     
     res.json({ success: true, count: videoIds.length, status: 'processing' });
@@ -437,8 +618,7 @@ app.post('/api/webhook/blog', async (req, res) => {
   try {
     const { title, content, category, excerpt, thumbnail } = req.body;
     if (!title || !content) return res.status(400).json({ error: 'Title and content required' });
-    const settingsResult = await pool.query("SELECT value FROM settings WHERE key = 'autopilot'");
-    const autopilot = settingsResult.rows[0]?.value === 'true';
+    const autopilot = await getSetting('autopilot') === 'true';
     const postStatus = autopilot ? 'published' : 'draft';
     const slug = generateSlug(title) + '-' + Date.now();
     const result = await pool.query(`INSERT INTO posts (title, slug, content, category, excerpt, thumbnail, date, read_time, status, published_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`, [title, slug, content, category || 'Genel', excerpt || content.substring(0, 150) + '...', thumbnail || '', formatDateTR(), calculateReadTime(content), postStatus, postStatus === 'published' ? new Date() : null]);
@@ -505,4 +685,9 @@ app.listen(PORT, async () => {
   console.log(`🚀 Atasa Blog API on port ${PORT}`);
   console.log(`📡 Audio Processor: ${AUDIO_PROCESSOR_URL}`);
   await initDB();
+  
+  // Run initial scan after 10 seconds
+  setTimeout(() => {
+    autoScanVideos();
+  }, 10000);
 });
