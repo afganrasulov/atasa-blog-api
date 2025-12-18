@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
+import { YoutubeTranscript } from 'youtube-transcript';
 import 'dotenv/config';
 
 const { Pool } = pg;
@@ -137,10 +138,91 @@ app.get('/', (req, res) => {
       'PUT /api/posts/:id/unpublish': 'Unpublish to draft',
       'DELETE /api/posts/:id': 'Delete post by ID',
       'GET /api/settings': 'Get settings',
-      'PUT /api/settings': 'Update settings'
+      'PUT /api/settings': 'Update settings',
+      'GET /api/youtube/transcript/:videoId': 'Get YouTube video transcript'
     }
   });
 });
+
+// =====================
+// YOUTUBE TRANSCRIPT
+// =====================
+
+// GET YouTube video transcript
+app.get('/api/youtube/transcript/:videoId', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const { lang } = req.query; // Optional language parameter
+    
+    console.log(`📺 Fetching transcript for video: ${videoId}`);
+    
+    // Try to get transcript
+    let transcript;
+    try {
+      if (lang) {
+        transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang });
+      } else {
+        // Try Turkish first, then English, then any available
+        try {
+          transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'tr' });
+        } catch {
+          try {
+            transcript = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' });
+          } catch {
+            transcript = await YoutubeTranscript.fetchTranscript(videoId);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Transcript fetch error:', error.message);
+      return res.status(404).json({ 
+        error: 'Transcript not available',
+        message: 'Bu video için altyazı bulunamadı. Video altyazısı kapalı olabilir.',
+        videoId 
+      });
+    }
+    
+    if (!transcript || transcript.length === 0) {
+      return res.status(404).json({ 
+        error: 'No transcript found',
+        message: 'Altyazı bulunamadı',
+        videoId 
+      });
+    }
+    
+    // Combine transcript segments into full text
+    const fullText = transcript.map(segment => segment.text).join(' ');
+    
+    // Clean up the text
+    const cleanedText = fullText
+      .replace(/\[.*?\]/g, '') // Remove [Music], [Applause] etc.
+      .replace(/\s+/g, ' ')    // Normalize whitespace
+      .trim();
+    
+    console.log(`✅ Transcript fetched: ${cleanedText.length} characters`);
+    
+    res.json({
+      success: true,
+      videoId,
+      transcript: cleanedText,
+      segments: transcript,
+      segmentCount: transcript.length,
+      characterCount: cleanedText.length,
+      wordCount: cleanedText.split(' ').length
+    });
+    
+  } catch (error) {
+    console.error('Transcript error:', error);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message 
+    });
+  }
+});
+
+// =====================
+// SETTINGS
+// =====================
 
 // GET settings
 app.get('/api/settings', async (req, res) => {
@@ -182,6 +264,10 @@ app.put('/api/settings', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// =====================
+// POSTS
+// =====================
 
 // GET all posts (for admin)
 app.get('/api/posts/all', async (req, res) => {
