@@ -1,54 +1,63 @@
 import express from 'express';
 import cors from 'cors';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import pg from 'pg';
 import 'dotenv/config';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const { Pool } = pg;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const POSTS_FILE = join(__dirname, '../data/posts.json');
-const SETTINGS_FILE = join(__dirname, '../data/settings.json');
 
-// Ensure data directory exists
-const dataDir = join(__dirname, '../data');
-if (!existsSync(dataDir)) {
-  mkdirSync(dataDir, { recursive: true });
-}
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// Helper: Read posts from file
-function getPosts() {
-  if (!existsSync(POSTS_FILE)) {
-    return [];
+// Initialize database tables
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS posts (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(500) NOT NULL,
+        slug VARCHAR(500) UNIQUE NOT NULL,
+        content TEXT NOT NULL,
+        category VARCHAR(100) DEFAULT 'Genel',
+        excerpt TEXT,
+        thumbnail VARCHAR(500),
+        date VARCHAR(100),
+        read_time VARCHAR(50),
+        status VARCHAR(20) DEFAULT 'draft',
+        scheduled_at TIMESTAMP,
+        published_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key VARCHAR(100) PRIMARY KEY,
+        value VARCHAR(500)
+      )
+    `);
+
+    // Insert default autopilot setting if not exists
+    await pool.query(`
+      INSERT INTO settings (key, value) 
+      VALUES ('autopilot', 'false') 
+      ON CONFLICT (key) DO NOTHING
+    `);
+
+    console.log('✅ Database initialized');
+  } catch (error) {
+    console.error('Database init error:', error);
   }
-  const data = readFileSync(POSTS_FILE, 'utf-8');
-  return JSON.parse(data);
-}
-
-// Helper: Write posts to file
-function savePosts(posts) {
-  writeFileSync(POSTS_FILE, JSON.stringify(posts, null, 2));
-}
-
-// Helper: Read settings
-function getSettings() {
-  if (!existsSync(SETTINGS_FILE)) {
-    return { autopilot: false };
-  }
-  const data = readFileSync(SETTINGS_FILE, 'utf-8');
-  return JSON.parse(data);
-}
-
-// Helper: Write settings
-function saveSettings(settings) {
-  writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
 }
 
 // Helper: Generate slug from title
@@ -67,27 +76,41 @@ function generateSlug(title) {
     .trim();
 }
 
-// Helper: Check and publish scheduled posts
-function checkScheduledPosts() {
-  const posts = getPosts();
-  const now = new Date();
-  let updated = false;
-
-  posts.forEach(post => {
-    if (post.status === 'scheduled' && post.scheduledAt) {
-      const scheduledDate = new Date(post.scheduledAt);
-      if (scheduledDate <= now) {
-        post.status = 'published';
-        post.publishedAt = now.toISOString();
-        post.date = now.toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', year: 'numeric' });
-        updated = true;
-        console.log(`Scheduled post published: ${post.title}`);
-      }
-    }
+// Helper: Format date in Turkish
+function formatDateTR() {
+  return new Date().toLocaleDateString('tr-TR', { 
+    day: 'numeric', 
+    month: 'long', 
+    year: 'numeric' 
   });
+}
 
-  if (updated) {
-    savePosts(posts);
+// Helper: Calculate read time
+function calculateReadTime(content) {
+  const words = content.split(' ').length;
+  return Math.ceil(words / 200) + ' dk okuma';
+}
+
+// Check and publish scheduled posts
+async function checkScheduledPosts() {
+  try {
+    const result = await pool.query(`
+      UPDATE posts 
+      SET status = 'published', 
+          published_at = CURRENT_TIMESTAMP,
+          date = $1
+      WHERE status = 'scheduled' 
+        AND scheduled_at <= CURRENT_TIMESTAMP
+      RETURNING title
+    `, [formatDateTR()]);
+    
+    if (result.rows.length > 0) {
+      result.rows.forEach(post => {
+        console.log(`📅 Scheduled post published: ${post.title}`);
+      });
+    }
+  } catch (error) {
+    console.error('Schedule check error:', error);
   }
 }
 
@@ -98,7 +121,7 @@ setInterval(checkScheduledPosts, 60000);
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
-    message: 'Atasa Blog API is running',
+    message: 'Atasa Blog API is running (PostgreSQL)',
     endpoints: {
       'GET /api/posts': 'List published posts (for frontend)',
       'GET /api/posts/all': 'List all posts (for admin)',
@@ -114,30 +137,45 @@ app.get('/', (req, res) => {
       'PUT /api/posts/:id/unpublish': 'Unpublish to draft',
       'DELETE /api/posts/:id': 'Delete post by ID',
       'GET /api/settings': 'Get settings',
-      'PUT /api/settings': 'Update settings (autopilot etc)'
+      'PUT /api/settings': 'Update settings'
     }
   });
 });
 
 // GET settings
-app.get('/api/settings', (req, res) => {
-  const settings = getSettings();
-  res.json(settings);
+app.get('/api/settings', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT key, value FROM settings');
+    const settings = {};
+    result.rows.forEach(row => {
+      settings[row.key] = row.value === 'true';
+    });
+    res.json(settings);
+  } catch (error) {
+    console.error('Settings error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // PUT settings
-app.put('/api/settings', (req, res) => {
+app.put('/api/settings', async (req, res) => {
   try {
-    const settings = getSettings();
     const { autopilot } = req.body;
     
     if (typeof autopilot === 'boolean') {
-      settings.autopilot = autopilot;
+      await pool.query(
+        'UPDATE settings SET value = $1 WHERE key = $2',
+        [autopilot.toString(), 'autopilot']
+      );
     }
     
-    saveSettings(settings);
-    console.log(`Settings updated: autopilot=${settings.autopilot}`);
+    const result = await pool.query('SELECT key, value FROM settings');
+    const settings = {};
+    result.rows.forEach(row => {
+      settings[row.key] = row.value === 'true';
+    });
     
+    console.log(`⚙️ Settings updated: autopilot=${settings.autopilot}`);
     res.json({ success: true, settings });
   } catch (error) {
     console.error('Settings error:', error);
@@ -145,55 +183,91 @@ app.put('/api/settings', (req, res) => {
   }
 });
 
-// GET all posts (for admin - includes drafts and scheduled)
-app.get('/api/posts/all', (req, res) => {
-  const posts = getPosts();
-  res.json(posts);
+// GET all posts (for admin)
+app.get('/api/posts/all', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM posts ORDER BY created_at DESC'
+    );
+    res.json(result.rows.map(formatPost));
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // GET only published posts (for frontend)
-app.get('/api/posts', (req, res) => {
-  const posts = getPosts();
-  const published = posts.filter(p => p.status === 'published');
-  res.json(published);
+app.get('/api/posts', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM posts WHERE status = 'published' ORDER BY published_at DESC"
+    );
+    res.json(result.rows.map(formatPost));
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // GET draft posts
-app.get('/api/posts/drafts', (req, res) => {
-  const posts = getPosts();
-  const drafts = posts.filter(p => p.status === 'draft');
-  res.json(drafts);
+app.get('/api/posts/drafts', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM posts WHERE status = 'draft' ORDER BY created_at DESC"
+    );
+    res.json(result.rows.map(formatPost));
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // GET scheduled posts
-app.get('/api/posts/scheduled', (req, res) => {
-  const posts = getPosts();
-  const scheduled = posts.filter(p => p.status === 'scheduled');
-  res.json(scheduled);
-});
-
-// GET single post by ID (must be before :slug route)
-app.get('/api/posts/id/:id', (req, res) => {
-  const posts = getPosts();
-  const post = posts.find(p => p.id === req.params.id);
-  if (!post) {
-    return res.status(404).json({ error: 'Post not found' });
+app.get('/api/posts/scheduled', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM posts WHERE status = 'scheduled' ORDER BY scheduled_at ASC"
+    );
+    res.json(result.rows.map(formatPost));
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
-  res.json(post);
 });
 
-// GET single post by slug
-app.get('/api/posts/:slug', (req, res) => {
-  const posts = getPosts();
-  const post = posts.find(p => p.slug === req.params.slug && p.status === 'published');
-  if (!post) {
-    return res.status(404).json({ error: 'Post not found' });
+// GET single post by ID
+app.get('/api/posts/id/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM posts WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    res.json(formatPost(result.rows[0]));
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
-  res.json(post);
 });
 
-// POST - Create new post (direct API)
-app.post('/api/posts', (req, res) => {
+// GET single post by slug (only published)
+app.get('/api/posts/:slug', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM posts WHERE slug = $1 AND status = 'published'", 
+      [req.params.slug]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    res.json(formatPost(result.rows[0]));
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST - Create new post
+app.post('/api/posts', async (req, res) => {
   try {
     const { title, content, category, excerpt, thumbnail, status } = req.body;
     
@@ -201,45 +275,38 @@ app.post('/api/posts', (req, res) => {
       return res.status(400).json({ error: 'Title and content are required' });
     }
     
-    const posts = getPosts();
+    const slug = generateSlug(title);
+    const postStatus = status || 'draft';
+    const date = formatDateTR();
+    const readTime = calculateReadTime(content);
+    const postExcerpt = excerpt || content.substring(0, 150) + '...';
+    const postThumbnail = thumbnail || 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=800&q=80';
     
-    const newPost = {
-      id: Date.now().toString(),
-      title,
-      slug: generateSlug(title),
-      content,
-      category: category || 'Genel',
-      excerpt: excerpt || content.substring(0, 150) + '...',
-      thumbnail: thumbnail || 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=800&q=80',
-      date: new Date().toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', year: 'numeric' }),
-      readTime: Math.ceil(content.split(' ').length / 200) + ' dk okuma',
-      status: status || 'draft',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
+    const result = await pool.query(`
+      INSERT INTO posts (title, slug, content, category, excerpt, thumbnail, date, read_time, status, published_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *
+    `, [
+      title, slug, content, category || 'Genel', postExcerpt, postThumbnail,
+      date, readTime, postStatus, 
+      postStatus === 'published' ? new Date() : null
+    ]);
     
-    if (newPost.status === 'published') {
-      newPost.publishedAt = new Date().toISOString();
-    }
-    
-    posts.unshift(newPost);
-    savePosts(posts);
-    
-    console.log(`New blog post created: ${newPost.title} (${newPost.status})`);
+    console.log(`✅ New post created: ${title} (${postStatus})`);
     
     res.status(201).json({ 
       success: true, 
       message: 'Blog post created successfully',
-      post: newPost 
+      post: formatPost(result.rows[0])
     });
   } catch (error) {
-    console.error('Create post error:', error);
+    console.error('Create error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// POST webhook - receives data from n8n (checks autopilot setting)
-app.post('/api/webhook/blog', (req, res) => {
+// POST webhook - receives data from n8n
+app.post('/api/webhook/blog', async (req, res) => {
   try {
     const { title, content, category, excerpt, thumbnail } = req.body;
     
@@ -247,38 +314,34 @@ app.post('/api/webhook/blog', (req, res) => {
       return res.status(400).json({ error: 'Title and content are required' });
     }
     
-    const settings = getSettings();
-    const posts = getPosts();
+    // Check autopilot setting
+    const settingsResult = await pool.query("SELECT value FROM settings WHERE key = 'autopilot'");
+    const autopilot = settingsResult.rows[0]?.value === 'true';
     
-    const newPost = {
-      id: Date.now().toString(),
-      title,
-      slug: generateSlug(title),
-      content,
-      category: category || 'Genel',
-      excerpt: excerpt || content.substring(0, 150) + '...',
-      thumbnail: thumbnail || 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=800&q=80',
-      date: new Date().toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', year: 'numeric' }),
-      readTime: Math.ceil(content.split(' ').length / 200) + ' dk okuma',
-      status: settings.autopilot ? 'published' : 'draft',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
+    const slug = generateSlug(title);
+    const postStatus = autopilot ? 'published' : 'draft';
+    const date = formatDateTR();
+    const readTime = calculateReadTime(content);
+    const postExcerpt = excerpt || content.substring(0, 150) + '...';
+    const postThumbnail = thumbnail || 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=800&q=80';
     
-    if (newPost.status === 'published') {
-      newPost.publishedAt = new Date().toISOString();
-    }
+    const result = await pool.query(`
+      INSERT INTO posts (title, slug, content, category, excerpt, thumbnail, date, read_time, status, published_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *
+    `, [
+      title, slug, content, category || 'Genel', postExcerpt, postThumbnail,
+      date, readTime, postStatus,
+      postStatus === 'published' ? new Date() : null
+    ]);
     
-    posts.unshift(newPost);
-    savePosts(posts);
-    
-    console.log(`New blog post via webhook: ${newPost.title} (${newPost.status}, autopilot=${settings.autopilot})`);
+    console.log(`📝 Webhook post: ${title} (${postStatus}, autopilot=${autopilot})`);
     
     res.status(201).json({ 
       success: true, 
-      message: `Blog post created as ${newPost.status}`,
-      post: newPost,
-      autopilot: settings.autopilot
+      message: `Blog post created as ${postStatus}`,
+      post: formatPost(result.rows[0]),
+      autopilot
     });
   } catch (error) {
     console.error('Webhook error:', error);
@@ -287,31 +350,25 @@ app.post('/api/webhook/blog', (req, res) => {
 });
 
 // PUT - Publish a post
-app.put('/api/posts/:id/publish', (req, res) => {
+app.put('/api/posts/:id/publish', async (req, res) => {
   try {
-    const { id } = req.params;
-    const posts = getPosts();
-    const postIndex = posts.findIndex(p => p.id === id);
+    const result = await pool.query(`
+      UPDATE posts 
+      SET status = 'published', 
+          published_at = CURRENT_TIMESTAMP,
+          scheduled_at = NULL,
+          date = $1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING *
+    `, [formatDateTR(), req.params.id]);
     
-    if (postIndex === -1) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Post not found' });
     }
     
-    posts[postIndex].status = 'published';
-    posts[postIndex].publishedAt = new Date().toISOString();
-    posts[postIndex].date = new Date().toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', year: 'numeric' });
-    posts[postIndex].updatedAt = new Date().toISOString();
-    posts[postIndex].scheduledAt = null;
-    
-    savePosts(posts);
-    
-    console.log(`Blog post published: ${posts[postIndex].title}`);
-    
-    res.json({ 
-      success: true, 
-      message: 'Blog post published',
-      post: posts[postIndex]
-    });
+    console.log(`🚀 Post published: ${result.rows[0].title}`);
+    res.json({ success: true, message: 'Post published', post: formatPost(result.rows[0]) });
   } catch (error) {
     console.error('Publish error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -319,150 +376,151 @@ app.put('/api/posts/:id/publish', (req, res) => {
 });
 
 // PUT - Schedule a post
-app.put('/api/posts/:id/schedule', (req, res) => {
+app.put('/api/posts/:id/schedule', async (req, res) => {
   try {
-    const { id } = req.params;
     const { scheduledAt } = req.body;
     
     if (!scheduledAt) {
       return res.status(400).json({ error: 'scheduledAt is required' });
     }
     
-    const posts = getPosts();
-    const postIndex = posts.findIndex(p => p.id === id);
+    const result = await pool.query(`
+      UPDATE posts 
+      SET status = 'scheduled', 
+          scheduled_at = $1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING *
+    `, [scheduledAt, req.params.id]);
     
-    if (postIndex === -1) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Post not found' });
     }
     
-    posts[postIndex].status = 'scheduled';
-    posts[postIndex].scheduledAt = scheduledAt;
-    posts[postIndex].updatedAt = new Date().toISOString();
-    
-    savePosts(posts);
-    
-    console.log(`Blog post scheduled: ${posts[postIndex].title} for ${scheduledAt}`);
-    
-    res.json({ 
-      success: true, 
-      message: 'Blog post scheduled',
-      post: posts[postIndex]
-    });
+    console.log(`📅 Post scheduled: ${result.rows[0].title} for ${scheduledAt}`);
+    res.json({ success: true, message: 'Post scheduled', post: formatPost(result.rows[0]) });
   } catch (error) {
     console.error('Schedule error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// PUT - Unpublish a post (back to draft)
-app.put('/api/posts/:id/unpublish', (req, res) => {
+// PUT - Unpublish a post
+app.put('/api/posts/:id/unpublish', async (req, res) => {
   try {
-    const { id } = req.params;
-    const posts = getPosts();
-    const postIndex = posts.findIndex(p => p.id === id);
+    const result = await pool.query(`
+      UPDATE posts 
+      SET status = 'draft', 
+          published_at = NULL,
+          scheduled_at = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING *
+    `, [req.params.id]);
     
-    if (postIndex === -1) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Post not found' });
     }
     
-    posts[postIndex].status = 'draft';
-    posts[postIndex].publishedAt = null;
-    posts[postIndex].scheduledAt = null;
-    posts[postIndex].updatedAt = new Date().toISOString();
-    
-    savePosts(posts);
-    
-    console.log(`Blog post unpublished: ${posts[postIndex].title}`);
-    
-    res.json({ 
-      success: true, 
-      message: 'Blog post moved to drafts',
-      post: posts[postIndex]
-    });
+    console.log(`📝 Post unpublished: ${result.rows[0].title}`);
+    res.json({ success: true, message: 'Post moved to drafts', post: formatPost(result.rows[0]) });
   } catch (error) {
     console.error('Unpublish error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// PUT - Update post by ID
-app.put('/api/posts/:id', (req, res) => {
+// PUT - Update post
+app.put('/api/posts/:id', async (req, res) => {
   try {
-    const { id } = req.params;
     const { title, content, category, excerpt, thumbnail, status } = req.body;
     
-    const posts = getPosts();
-    const postIndex = posts.findIndex(p => p.id === id);
-    
-    if (postIndex === -1) {
+    // Get existing post
+    const existing = await pool.query('SELECT * FROM posts WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) {
       return res.status(404).json({ error: 'Post not found' });
     }
     
-    const existingPost = posts[postIndex];
+    const post = existing.rows[0];
+    const newTitle = title || post.title;
+    const newContent = content || post.content;
     
-    const updatedPost = {
-      ...existingPost,
-      title: title || existingPost.title,
-      slug: title ? generateSlug(title) : existingPost.slug,
-      content: content || existingPost.content,
-      category: category || existingPost.category,
-      excerpt: excerpt || (content ? content.substring(0, 150) + '...' : existingPost.excerpt),
-      thumbnail: thumbnail || existingPost.thumbnail,
-      readTime: content ? Math.ceil(content.split(' ').length / 200) + ' dk okuma' : existingPost.readTime,
-      status: status || existingPost.status,
-      updatedAt: new Date().toISOString()
-    };
+    const result = await pool.query(`
+      UPDATE posts SET
+        title = $1,
+        slug = $2,
+        content = $3,
+        category = $4,
+        excerpt = $5,
+        thumbnail = $6,
+        read_time = $7,
+        status = $8,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $9
+      RETURNING *
+    `, [
+      newTitle,
+      title ? generateSlug(newTitle) : post.slug,
+      newContent,
+      category || post.category,
+      excerpt || (content ? content.substring(0, 150) + '...' : post.excerpt),
+      thumbnail || post.thumbnail,
+      content ? calculateReadTime(newContent) : post.read_time,
+      status || post.status,
+      req.params.id
+    ]);
     
-    posts[postIndex] = updatedPost;
-    savePosts(posts);
-    
-    console.log(`Blog post updated: ${updatedPost.title}`);
-    
-    res.json({ 
-      success: true, 
-      message: 'Blog post updated successfully',
-      post: updatedPost 
-    });
+    console.log(`✏️ Post updated: ${result.rows[0].title}`);
+    res.json({ success: true, message: 'Post updated', post: formatPost(result.rows[0]) });
   } catch (error) {
-    console.error('Update post error:', error);
+    console.error('Update error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// DELETE - Delete post by ID
-app.delete('/api/posts/:id', (req, res) => {
+// DELETE - Delete post
+app.delete('/api/posts/:id', async (req, res) => {
   try {
-    const { id } = req.params;
+    const result = await pool.query(
+      'DELETE FROM posts WHERE id = $1 RETURNING title',
+      [req.params.id]
+    );
     
-    const posts = getPosts();
-    const postIndex = posts.findIndex(p => p.id === id);
-    
-    if (postIndex === -1) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Post not found' });
     }
     
-    const deletedPost = posts[postIndex];
-    posts.splice(postIndex, 1);
-    savePosts(posts);
-    
-    console.log(`Blog post deleted: ${deletedPost.title}`);
-    
-    res.json({ 
-      success: true, 
-      message: 'Blog post deleted successfully',
-      deletedPost: {
-        id: deletedPost.id,
-        title: deletedPost.title
-      }
-    });
+    console.log(`🗑️ Post deleted: ${result.rows[0].title}`);
+    res.json({ success: true, message: 'Post deleted', deletedPost: result.rows[0] });
   } catch (error) {
-    console.error('Delete post error:', error);
+    console.error('Delete error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.listen(PORT, () => {
+// Helper: Format post for API response (convert snake_case to camelCase)
+function formatPost(row) {
+  return {
+    id: row.id.toString(),
+    title: row.title,
+    slug: row.slug,
+    content: row.content,
+    category: row.category,
+    excerpt: row.excerpt,
+    thumbnail: row.thumbnail,
+    date: row.date,
+    readTime: row.read_time,
+    status: row.status,
+    scheduledAt: row.scheduled_at,
+    publishedAt: row.published_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+// Start server
+app.listen(PORT, async () => {
   console.log(`🚀 Atasa Blog API running on port ${PORT}`);
-  // Check scheduled posts on startup
+  await initDB();
   checkScheduledPosts();
 });
