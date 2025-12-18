@@ -106,9 +106,28 @@ app.post('/api/youtube/videos', async (req, res) => {
     const { videos } = req.body;
     if (!videos || !Array.isArray(videos)) return res.status(400).json({ error: 'Videos array required' });
     for (const video of videos) {
-      await pool.query(`INSERT INTO youtube_videos (id, title, description, thumbnail, duration, view_count, published_at, channel_id, video_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO UPDATE SET title = $2, description = $3, thumbnail = $4, duration = $5, view_count = $6, published_at = $7, updated_at = CURRENT_TIMESTAMP`, [video.id, video.title, video.description, video.thumbnail, video.duration, video.viewCount, video.publishedAt, video.channelId, video.type || 'video']);
+      await pool.query(`INSERT INTO youtube_videos (id, title, description, thumbnail, duration, view_count, published_at, channel_id, video_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO UPDATE SET title = $2, description = $3, thumbnail = $4, duration = $5, view_count = $6, published_at = $7, video_type = $9, updated_at = CURRENT_TIMESTAMP`, [video.id, video.title, video.description, video.thumbnail, video.duration, video.viewCount, video.publishedAt, video.channelId, video.type || 'video']);
     }
     res.json({ success: true, count: videos.length });
+  } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Reclassify videos - update video types based on provided data
+app.post('/api/youtube/videos/reclassify', async (req, res) => {
+  try {
+    const { videos } = req.body;
+    if (!videos || !Array.isArray(videos)) return res.status(400).json({ error: 'Videos array required' });
+    
+    let updated = 0;
+    for (const video of videos) {
+      const result = await pool.query(
+        `UPDATE youtube_videos SET video_type = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND video_type != $1`,
+        [video.type, video.id]
+      );
+      if (result.rowCount > 0) updated++;
+    }
+    
+    res.json({ success: true, updated, total: videos.length });
   } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
