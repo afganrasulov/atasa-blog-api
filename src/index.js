@@ -70,20 +70,6 @@ async function initDB() {
       )
     `);
 
-    // Transcription jobs table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS transcription_jobs (
-        id SERIAL PRIMARY KEY,
-        video_id VARCHAR(50) REFERENCES youtube_videos(id),
-        status VARCHAR(20) DEFAULT 'pending',
-        model VARCHAR(50) DEFAULT 'base',
-        progress INTEGER DEFAULT 0,
-        error TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
     // Allowed users table (for admin access)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS allowed_users (
@@ -206,19 +192,13 @@ app.delete('/api/auth/users/:id', async (req, res) => {
 // YOUTUBE VIDEOS
 // =====================
 
-// Get all cached videos
 app.get('/api/youtube/videos', async (req, res) => {
   try {
     const { type } = req.query;
     let query = 'SELECT * FROM youtube_videos';
     let params = [];
-    
-    if (type) {
-      query += ' WHERE video_type = $1';
-      params.push(type);
-    }
+    if (type) { query += ' WHERE video_type = $1'; params.push(type); }
     query += ' ORDER BY published_at DESC';
-    
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (error) {
@@ -226,42 +206,24 @@ app.get('/api/youtube/videos', async (req, res) => {
   }
 });
 
-// Save/update videos (bulk)
 app.post('/api/youtube/videos', async (req, res) => {
   try {
     const { videos } = req.body;
-    if (!videos || !Array.isArray(videos)) {
-      return res.status(400).json({ error: 'Videos array required' });
-    }
+    if (!videos || !Array.isArray(videos)) return res.status(400).json({ error: 'Videos array required' });
     
     for (const video of videos) {
       await pool.query(`
         INSERT INTO youtube_videos (id, title, description, thumbnail, duration, view_count, published_at, channel_id, video_type)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (id) DO UPDATE SET
-          title = $2, description = $3, thumbnail = $4, duration = $5, 
-          view_count = $6, published_at = $7, updated_at = CURRENT_TIMESTAMP
-      `, [
-        video.id,
-        video.title,
-        video.description,
-        video.thumbnail,
-        video.duration,
-        video.viewCount,
-        video.publishedAt,
-        video.channelId,
-        video.type || 'video'
-      ]);
+        ON CONFLICT (id) DO UPDATE SET title = $2, description = $3, thumbnail = $4, duration = $5, view_count = $6, published_at = $7, updated_at = CURRENT_TIMESTAMP
+      `, [video.id, video.title, video.description, video.thumbnail, video.duration, video.viewCount, video.publishedAt, video.channelId, video.type || 'video']);
     }
-    
     res.json({ success: true, count: videos.length });
   } catch (error) {
-    console.error('Save videos error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get single video
 app.get('/api/youtube/videos/:id', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM youtube_videos WHERE id = $1', [req.params.id]);
@@ -272,21 +234,12 @@ app.get('/api/youtube/videos/:id', async (req, res) => {
   }
 });
 
-// Update video transcript
 app.put('/api/youtube/videos/:id/transcript', async (req, res) => {
   try {
     const { transcript, model, status } = req.body;
-    
     await pool.query(`
-      UPDATE youtube_videos SET 
-        transcript = $1, 
-        transcript_model = $2, 
-        transcript_status = $3,
-        transcript_updated_at = CURRENT_TIMESTAMP,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $4
+      UPDATE youtube_videos SET transcript = $1, transcript_model = $2, transcript_status = $3, transcript_updated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $4
     `, [transcript, model, status || 'completed', req.params.id]);
-    
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -294,100 +247,51 @@ app.put('/api/youtube/videos/:id/transcript', async (req, res) => {
 });
 
 // =====================
-// TRANSCRIPTION JOBS
+// WHISPER TRANSCRIPTION
 // =====================
 
-// Get all jobs
-app.get('/api/transcription/jobs', async (req, res) => {
+// AssemblyAI - Start transcription
+app.post('/api/transcribe/assemblyai', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT j.*, v.title as video_title, v.thumbnail 
-      FROM transcription_jobs j 
-      JOIN youtube_videos v ON j.video_id = v.id 
-      ORDER BY j.created_at DESC
-    `);
-    res.json(result.rows);
+    const { videoUrl, apiKey } = req.body;
+    if (!videoUrl || !apiKey) return res.status(400).json({ error: 'videoUrl and apiKey required' });
+
+    const submitResponse = await fetch('https://api.assemblyai.com/v2/transcript', {
+      method: 'POST',
+      headers: { 'Authorization': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio_url: videoUrl, language_code: 'tr' })
+    });
+
+    const submitData = await submitResponse.json();
+    if (submitData.error) throw new Error(submitData.error);
+
+    res.json({ success: true, transcriptId: submitData.id, status: 'processing' });
   } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Create job
-app.post('/api/transcription/jobs', async (req, res) => {
+// AssemblyAI - Check status
+app.get('/api/transcribe/assemblyai/:id', async (req, res) => {
   try {
-    const { videoId, model } = req.body;
-    if (!videoId) return res.status(400).json({ error: 'videoId required' });
+    const { apiKey } = req.query;
+    if (!apiKey) return res.status(400).json({ error: 'apiKey required' });
+
+    const response = await fetch(`https://api.assemblyai.com/v2/transcript/${req.params.id}`, {
+      headers: { 'Authorization': apiKey }
+    });
+
+    const data = await response.json();
     
-    // Check if video exists
-    const videoCheck = await pool.query('SELECT id FROM youtube_videos WHERE id = $1', [videoId]);
-    if (videoCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Video not found' });
+    if (data.status === 'completed') {
+      res.json({ success: true, status: 'completed', transcript: data.text });
+    } else if (data.status === 'error') {
+      res.json({ success: false, status: 'error', error: data.error });
+    } else {
+      res.json({ success: true, status: data.status });
     }
-    
-    // Check for existing pending job
-    const existingJob = await pool.query(
-      'SELECT * FROM transcription_jobs WHERE video_id = $1 AND status IN ($2, $3)',
-      [videoId, 'pending', 'processing']
-    );
-    
-    if (existingJob.rows.length > 0) {
-      return res.json({ success: true, job: existingJob.rows[0], existing: true });
-    }
-    
-    // Create new job
-    const result = await pool.query(`
-      INSERT INTO transcription_jobs (video_id, model, status)
-      VALUES ($1, $2, 'pending')
-      RETURNING *
-    `, [videoId, model || 'base']);
-    
-    // Update video status
-    await pool.query(
-      'UPDATE youtube_videos SET transcript_status = $1 WHERE id = $2',
-      ['processing', videoId]
-    );
-    
-    res.json({ success: true, job: result.rows[0] });
   } catch (error) {
-    console.error('Create job error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update job status
-app.put('/api/transcription/jobs/:id', async (req, res) => {
-  try {
-    const { status, progress, error } = req.body;
-    
-    await pool.query(`
-      UPDATE transcription_jobs SET 
-        status = COALESCE($1, status),
-        progress = COALESCE($2, progress),
-        error = $3,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $4
-    `, [status, progress, error, req.params.id]);
-    
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get pending jobs (for worker)
-app.get('/api/transcription/pending', async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT j.*, v.title as video_title 
-      FROM transcription_jobs j 
-      JOIN youtube_videos v ON j.video_id = v.id 
-      WHERE j.status = 'pending'
-      ORDER BY j.created_at ASC
-      LIMIT 1
-    `);
-    res.json(result.rows[0] || null);
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -400,7 +304,6 @@ app.get('/api/settings', async (req, res) => {
     const result = await pool.query('SELECT key, value FROM settings');
     const settings = {};
     result.rows.forEach(row => {
-      // Parse boolean values
       if (row.value === 'true') settings[row.key] = true;
       else if (row.value === 'false') settings[row.key] = false;
       else settings[row.key] = row.value;
@@ -414,19 +317,9 @@ app.get('/api/settings', async (req, res) => {
 app.put('/api/settings', async (req, res) => {
   try {
     for (const [key, value] of Object.entries(req.body)) {
-      await pool.query(
-        'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2',
-        [key, String(value)]
-      );
+      await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2', [key, String(value)]);
     }
-    const result = await pool.query('SELECT key, value FROM settings');
-    const settings = {};
-    result.rows.forEach(row => {
-      if (row.value === 'true') settings[row.key] = true;
-      else if (row.value === 'false') settings[row.key] = false;
-      else settings[row.key] = row.value;
-    });
-    res.json({ success: true, settings });
+    res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -454,34 +347,6 @@ app.get('/api/posts', async (req, res) => {
   }
 });
 
-app.get('/api/posts/drafts', async (req, res) => {
-  try {
-    const result = await pool.query("SELECT * FROM posts WHERE status = 'draft' ORDER BY created_at DESC");
-    res.json(result.rows.map(formatPost));
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/posts/scheduled', async (req, res) => {
-  try {
-    const result = await pool.query("SELECT * FROM posts WHERE status = 'scheduled' ORDER BY scheduled_at ASC");
-    res.json(result.rows.map(formatPost));
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/posts/id/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM posts WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
-    res.json(formatPost(result.rows[0]));
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
 app.get('/api/posts/:slug', async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM posts WHERE slug = $1 AND status = 'published'", [req.params.slug]);
@@ -497,20 +362,13 @@ app.post('/api/posts', async (req, res) => {
     const { title, content, category, excerpt, thumbnail, status } = req.body;
     if (!title || !content) return res.status(400).json({ error: 'Title and content required' });
     
-    const slug = generateSlug(title);
+    const slug = generateSlug(title) + '-' + Date.now();
     const postStatus = status || 'draft';
     const result = await pool.query(`
       INSERT INTO posts (title, slug, content, category, excerpt, thumbnail, date, read_time, status, published_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *
-    `, [
-      title, slug, content, category || 'Genel',
-      excerpt || content.substring(0, 150) + '...',
-      thumbnail || 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=800&q=80',
-      formatDateTR(), calculateReadTime(content), postStatus,
-      postStatus === 'published' ? new Date() : null
-    ]);
+    `, [title, slug, content, category || 'Genel', excerpt || content.substring(0, 150) + '...', thumbnail || '', formatDateTR(), calculateReadTime(content), postStatus, postStatus === 'published' ? new Date() : null]);
     
-    console.log(`✅ Created: ${title}`);
     res.status(201).json({ success: true, post: formatPost(result.rows[0]) });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -526,19 +384,12 @@ app.post('/api/webhook/blog', async (req, res) => {
     const autopilot = settingsResult.rows[0]?.value === 'true';
     const postStatus = autopilot ? 'published' : 'draft';
     
-    const slug = generateSlug(title);
+    const slug = generateSlug(title) + '-' + Date.now();
     const result = await pool.query(`
       INSERT INTO posts (title, slug, content, category, excerpt, thumbnail, date, read_time, status, published_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *
-    `, [
-      title, slug, content, category || 'Genel',
-      excerpt || content.substring(0, 150) + '...',
-      thumbnail || 'https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=800&q=80',
-      formatDateTR(), calculateReadTime(content), postStatus,
-      postStatus === 'published' ? new Date() : null
-    ]);
+    `, [title, slug, content, category || 'Genel', excerpt || content.substring(0, 150) + '...', thumbnail || '', formatDateTR(), calculateReadTime(content), postStatus, postStatus === 'published' ? new Date() : null]);
     
-    console.log(`📝 Webhook: ${title} (${postStatus})`);
     res.status(201).json({ success: true, post: formatPost(result.rows[0]), autopilot });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -547,11 +398,7 @@ app.post('/api/webhook/blog', async (req, res) => {
 
 app.put('/api/posts/:id/publish', async (req, res) => {
   try {
-    const result = await pool.query(`
-      UPDATE posts SET status = 'published', published_at = CURRENT_TIMESTAMP,
-        scheduled_at = NULL, date = $1, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $2 RETURNING *
-    `, [formatDateTR(), req.params.id]);
+    const result = await pool.query(`UPDATE posts SET status = 'published', published_at = CURRENT_TIMESTAMP, scheduled_at = NULL, date = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`, [formatDateTR(), req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
     res.json({ success: true, post: formatPost(result.rows[0]) });
   } catch (error) {
@@ -563,10 +410,7 @@ app.put('/api/posts/:id/schedule', async (req, res) => {
   try {
     const { scheduledAt } = req.body;
     if (!scheduledAt) return res.status(400).json({ error: 'scheduledAt required' });
-    const result = await pool.query(`
-      UPDATE posts SET status = 'scheduled', scheduled_at = $1, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $2 RETURNING *
-    `, [scheduledAt, req.params.id]);
+    const result = await pool.query(`UPDATE posts SET status = 'scheduled', scheduled_at = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`, [scheduledAt, req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
     res.json({ success: true, post: formatPost(result.rows[0]) });
   } catch (error) {
@@ -576,10 +420,7 @@ app.put('/api/posts/:id/schedule', async (req, res) => {
 
 app.put('/api/posts/:id/unpublish', async (req, res) => {
   try {
-    const result = await pool.query(`
-      UPDATE posts SET status = 'draft', published_at = NULL, scheduled_at = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $1 RETURNING *
-    `, [req.params.id]);
+    const result = await pool.query(`UPDATE posts SET status = 'draft', published_at = NULL, scheduled_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *`, [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
     res.json({ success: true, post: formatPost(result.rows[0]) });
   } catch (error) {
@@ -594,21 +435,9 @@ app.put('/api/posts/:id', async (req, res) => {
     if (existing.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
     
     const post = existing.rows[0];
-    const newTitle = title || post.title;
-    const newContent = content || post.content;
-    
     const result = await pool.query(`
-      UPDATE posts SET title = $1, slug = $2, content = $3, category = $4,
-        excerpt = $5, thumbnail = $6, read_time = $7, status = $8, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $9 RETURNING *
-    `, [
-      newTitle, title ? generateSlug(newTitle) : post.slug, newContent,
-      category || post.category,
-      excerpt || (content ? content.substring(0, 150) + '...' : post.excerpt),
-      thumbnail || post.thumbnail,
-      content ? calculateReadTime(newContent) : post.read_time,
-      status || post.status, req.params.id
-    ]);
+      UPDATE posts SET title = $1, content = $2, category = $3, excerpt = $4, thumbnail = $5, read_time = $6, status = $7, updated_at = CURRENT_TIMESTAMP WHERE id = $8 RETURNING *
+    `, [title || post.title, content || post.content, category || post.category, excerpt || post.excerpt, thumbnail || post.thumbnail, content ? calculateReadTime(content) : post.read_time, status || post.status, req.params.id]);
     
     res.json({ success: true, post: formatPost(result.rows[0]) });
   } catch (error) {
@@ -628,20 +457,9 @@ app.delete('/api/posts/:id', async (req, res) => {
 
 function formatPost(row) {
   return {
-    id: row.id.toString(),
-    title: row.title,
-    slug: row.slug,
-    content: row.content,
-    category: row.category,
-    excerpt: row.excerpt,
-    thumbnail: row.thumbnail,
-    date: row.date,
-    readTime: row.read_time,
-    status: row.status,
-    scheduledAt: row.scheduled_at,
-    publishedAt: row.published_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
+    id: row.id.toString(), title: row.title, slug: row.slug, content: row.content, category: row.category,
+    excerpt: row.excerpt, thumbnail: row.thumbnail, date: row.date, readTime: row.read_time, status: row.status,
+    scheduledAt: row.scheduled_at, publishedAt: row.published_at, createdAt: row.created_at, updatedAt: row.updated_at
   };
 }
 
