@@ -3,6 +3,7 @@ import cors from 'cors';
 import pg from 'pg';
 import 'dotenv/config';
 import { setupCarouselRenderRoutes } from './carousel-render.js';
+import { setupInstagramRoutes } from './instagram-publisher.js';
 
 const { Pool } = pg;
 const app = express();
@@ -33,6 +34,7 @@ async function initDB() {
     // Carousel posts table for Instagram
     await pool.query(`CREATE TABLE IF NOT EXISTS carousel_posts (
       id SERIAL PRIMARY KEY,
+      tenant_id INTEGER,
       title VARCHAR(500) NOT NULL,
       week_start DATE,
       week_end DATE,
@@ -41,6 +43,9 @@ async function initDB() {
       cover_image_prompt TEXT,
       slides JSONB DEFAULT '[]',
       raw_news JSONB DEFAULT '[]',
+      caption TEXT,
+      ig_media_id VARCHAR(50),
+      scheduled_at TIMESTAMP,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       published_at TIMESTAMP
@@ -61,12 +66,82 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
     
+    // Multi-tenant tables for Instagram SaaS
+    await pool.query(`CREATE TABLE IF NOT EXISTS ig_tenants (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      slug VARCHAR(100) UNIQUE NOT NULL,
+      email VARCHAR(255) NOT NULL,
+      brand_name VARCHAR(100),
+      logo_url TEXT,
+      primary_color VARCHAR(7) DEFAULT '#000000',
+      ig_user_id VARCHAR(50),
+      ig_username VARCHAR(50),
+      ig_access_token TEXT,
+      ig_token_expires_at TIMESTAMP,
+      fb_page_id VARCHAR(50),
+      fb_page_name VARCHAR(255),
+      content_language VARCHAR(5) DEFAULT 'tr',
+      default_hashtags TEXT,
+      intro_template TEXT,
+      plan VARCHAR(20) DEFAULT 'free',
+      plan_expires_at TIMESTAMP,
+      monthly_post_limit INTEGER DEFAULT 4,
+      posts_this_month INTEGER DEFAULT 0,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS ig_tenant_users (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER REFERENCES ig_tenants(id) ON DELETE CASCADE,
+      email VARCHAR(255) NOT NULL,
+      name VARCHAR(255),
+      role VARCHAR(20) DEFAULT 'editor',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(tenant_id, email)
+    )`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS ig_templates (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      description TEXT,
+      cover_style JSONB DEFAULT '{}',
+      intro_style JSONB DEFAULT '{}',
+      category_style JSONB DEFAULT '{}',
+      background_color VARCHAR(7) DEFAULT '#FFFFFF',
+      text_color VARCHAR(7) DEFAULT '#000000',
+      accent_color VARCHAR(7) DEFAULT '#0066FF',
+      font_family VARCHAR(100) DEFAULT 'Inter',
+      is_public BOOLEAN DEFAULT FALSE,
+      created_by INTEGER REFERENCES ig_tenants(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await pool.query(`CREATE TABLE IF NOT EXISTS ig_scheduled_posts (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER REFERENCES ig_tenants(id) ON DELETE CASCADE,
+      carousel_id INTEGER REFERENCES carousel_posts(id) ON DELETE CASCADE,
+      scheduled_at TIMESTAMP NOT NULL,
+      status VARCHAR(20) DEFAULT 'pending',
+      ig_media_id VARCHAR(50),
+      error_message TEXT,
+      published_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    // Add columns if not exist
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS audio_url TEXT`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS audio_status VARCHAR(20) DEFAULT 'pending'`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS transcript_job_id VARCHAR(100)`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS blog_created BOOLEAN DEFAULT FALSE`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS blog_post_id INTEGER`);
     await pool.query(`ALTER TABLE posts ADD COLUMN IF NOT EXISTS video_id VARCHAR(50)`);
+    await pool.query(`ALTER TABLE carousel_posts ADD COLUMN IF NOT EXISTS tenant_id INTEGER`);
+    await pool.query(`ALTER TABLE carousel_posts ADD COLUMN IF NOT EXISTS ig_media_id VARCHAR(50)`);
+    await pool.query(`ALTER TABLE carousel_posts ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE carousel_posts ADD COLUMN IF NOT EXISTS caption TEXT`);
     
     // Default settings
     await pool.query(`INSERT INTO settings (key, value) VALUES ('autopilot', 'false') ON CONFLICT (key) DO NOTHING`);
@@ -78,7 +153,14 @@ async function initDB() {
     await pool.query(`INSERT INTO settings (key, value) VALUES ('scan_interval_hours', '6') ON CONFLICT (key) DO NOTHING`);
     await pool.query(`INSERT INTO settings (key, value) VALUES ('last_scan_time', '') ON CONFLICT (key) DO NOTHING`);
     await pool.query(`INSERT INTO allowed_users (email, name) VALUES ('afganrasulov@gmail.com', 'Afgan Rasulov') ON CONFLICT (email) DO NOTHING`);
-    console.log('✅ Database initialized');
+    
+    // Default template
+    await pool.query(`INSERT INTO ig_templates (name, description, is_public) VALUES ('Classic White', 'Temiz, minimalist beyaz tasarım', TRUE) ON CONFLICT DO NOTHING`);
+    
+    // Default tenant (Atasa)
+    await pool.query(`INSERT INTO ig_tenants (name, slug, email, brand_name, default_hashtags, plan, monthly_post_limit) VALUES ('Atasa Danışmanlık', 'atasa', 'info@atasadanismanlik.com', 'ATASA', '#göçmenlik #türkiye #oturmaiizni #çalışmaizni #vize #vatandaşlık', 'pro', 20) ON CONFLICT (slug) DO NOTHING`);
+    
+    console.log('✅ Database initialized with multi-tenant support');
   } catch (error) { console.error('Database init error:', error); }
 }
 
@@ -93,14 +175,80 @@ function parseDuration(d) {
   return (parseInt(m?.[1]) || 0) * 3600 + (parseInt(m?.[2]) || 0) * 60 + (parseInt(m?.[3]) || 0);
 }
 
-// Helper to get setting value
 async function getSetting(key) {
   const result = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
   return result.rows[0]?.value || null;
 }
 
 // =====================
-// DEMO NEWS API - Sahte göçmenlik haberleri
+// TENANT API ENDPOINTS
+// =====================
+app.get('/api/tenants', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, name, slug, email, brand_name, ig_username, plan, is_active, created_at FROM ig_tenants ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/tenants/:slug', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM ig_tenants WHERE slug = $1', [req.params.slug]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+    // Don't expose access token
+    const tenant = result.rows[0];
+    delete tenant.ig_access_token;
+    res.json(tenant);
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/tenants', async (req, res) => {
+  try {
+    const { name, slug, email, brand_name, default_hashtags, plan } = req.body;
+    if (!name || !slug || !email) return res.status(400).json({ error: 'name, slug, email required' });
+    
+    const result = await pool.query(
+      `INSERT INTO ig_tenants (name, slug, email, brand_name, default_hashtags, plan) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [name, slug.toLowerCase(), email, brand_name || name.split(' ')[0].toUpperCase(), default_hashtags || '', plan || 'free']
+    );
+    res.status(201).json({ success: true, tenant: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') return res.status(400).json({ error: 'Slug already exists' });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/tenants/:id', async (req, res) => {
+  try {
+    const { name, email, brand_name, logo_url, primary_color, default_hashtags, plan, monthly_post_limit, is_active } = req.body;
+    const result = await pool.query(
+      `UPDATE ig_tenants SET 
+        name = COALESCE($1, name),
+        email = COALESCE($2, email),
+        brand_name = COALESCE($3, brand_name),
+        logo_url = COALESCE($4, logo_url),
+        primary_color = COALESCE($5, primary_color),
+        default_hashtags = COALESCE($6, default_hashtags),
+        plan = COALESCE($7, plan),
+        monthly_post_limit = COALESCE($8, monthly_post_limit),
+        is_active = COALESCE($9, is_active),
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $10 RETURNING *`,
+      [name, email, brand_name, logo_url, primary_color, default_hashtags, plan, monthly_post_limit, is_active, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+    res.json({ success: true, tenant: result.rows[0] });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.delete('/api/tenants/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM ig_tenants WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// =====================
+// DEMO NEWS API
 // =====================
 function generateDemoNews() {
   const today = new Date();
@@ -149,24 +297,33 @@ function generateDemoNews() {
 app.get('/api/carousel/demo-news', (req, res) => res.json(generateDemoNews()));
 
 app.get('/api/carousel', async (req, res) => {
-  try { res.json((await pool.query('SELECT * FROM carousel_posts ORDER BY created_at DESC')).rows); }
-  catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+  try {
+    const { tenant } = req.query;
+    let query = 'SELECT c.*, t.name as tenant_name, t.brand_name FROM carousel_posts c LEFT JOIN ig_tenants t ON c.tenant_id = t.id';
+    let params = [];
+    if (tenant) {
+      query += ' WHERE t.slug = $1';
+      params.push(tenant);
+    }
+    query += ' ORDER BY c.created_at DESC';
+    res.json((await pool.query(query, params)).rows);
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/api/carousel/:id', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM carousel_posts WHERE id = $1', [req.params.id]);
+    const result = await pool.query('SELECT c.*, t.name as tenant_name, t.brand_name, t.default_hashtags FROM carousel_posts c LEFT JOIN ig_tenants t ON c.tenant_id = t.id WHERE c.id = $1', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Carousel not found' });
     res.json(result.rows[0]);
-  } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.post('/api/carousel', async (req, res) => {
   try {
-    const { title, week_start, week_end, slides, raw_news, cover_image_prompt } = req.body;
+    const { title, week_start, week_end, slides, raw_news, cover_image_prompt, tenant_id, caption } = req.body;
     const result = await pool.query(
-      `INSERT INTO carousel_posts (title, week_start, week_end, slides, raw_news, cover_image_prompt) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [title, week_start, week_end, JSON.stringify(slides || []), JSON.stringify(raw_news || []), cover_image_prompt]
+      `INSERT INTO carousel_posts (title, week_start, week_end, slides, raw_news, cover_image_prompt, tenant_id, caption) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [title, week_start, week_end, JSON.stringify(slides || []), JSON.stringify(raw_news || []), cover_image_prompt, tenant_id || null, caption || null]
     );
     res.status(201).json({ success: true, carousel: result.rows[0] });
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -174,10 +331,20 @@ app.post('/api/carousel', async (req, res) => {
 
 app.put('/api/carousel/:id', async (req, res) => {
   try {
-    const { title, slides, cover_image_url, cover_image_prompt, status } = req.body;
+    const { title, slides, cover_image_url, cover_image_prompt, status, caption, scheduled_at } = req.body;
     const result = await pool.query(
-      `UPDATE carousel_posts SET title = COALESCE($1, title), slides = COALESCE($2, slides), cover_image_url = COALESCE($3, cover_image_url), cover_image_prompt = COALESCE($4, cover_image_prompt), status = COALESCE($5, status), updated_at = CURRENT_TIMESTAMP, published_at = CASE WHEN $5 = 'published' THEN CURRENT_TIMESTAMP ELSE published_at END WHERE id = $6 RETURNING *`,
-      [title, slides ? JSON.stringify(slides) : null, cover_image_url, cover_image_prompt, status, req.params.id]
+      `UPDATE carousel_posts SET 
+        title = COALESCE($1, title), 
+        slides = COALESCE($2, slides), 
+        cover_image_url = COALESCE($3, cover_image_url), 
+        cover_image_prompt = COALESCE($4, cover_image_prompt), 
+        status = COALESCE($5, status),
+        caption = COALESCE($6, caption),
+        scheduled_at = COALESCE($7, scheduled_at),
+        updated_at = CURRENT_TIMESTAMP, 
+        published_at = CASE WHEN $5 = 'published' THEN CURRENT_TIMESTAMP ELSE published_at END 
+      WHERE id = $8 RETURNING *`,
+      [title, slides ? JSON.stringify(slides) : null, cover_image_url, cover_image_prompt, status, caption, scheduled_at, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Carousel not found' });
     res.json({ success: true, carousel: result.rows[0] });
@@ -186,41 +353,56 @@ app.put('/api/carousel/:id', async (req, res) => {
 
 app.delete('/api/carousel/:id', async (req, res) => {
   try { await pool.query('DELETE FROM carousel_posts WHERE id = $1', [req.params.id]); res.json({ success: true }); }
-  catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.post('/api/carousel/generate', async (req, res) => {
   try {
-    const { news_data, openai_content } = req.body;
+    const { news_data, openai_content, tenant_id } = req.body;
     if (!news_data) return res.status(400).json({ error: 'news_data required' });
     
-    let slides = [];
-    if (openai_content) {
-      slides = parseOpenAIContent(openai_content, news_data);
-    } else {
-      slides = createBasicSlides(news_data);
+    // Get tenant info for branding
+    let brandName = 'ATASA';
+    let hashtags = '';
+    if (tenant_id) {
+      const tenantResult = await pool.query('SELECT brand_name, default_hashtags FROM ig_tenants WHERE id = $1', [tenant_id]);
+      if (tenantResult.rows.length > 0) {
+        brandName = tenantResult.rows[0].brand_name || brandName;
+        hashtags = tenantResult.rows[0].default_hashtags || '';
+      }
     }
     
+    const slides = createSlidesWithBrand(news_data, brandName);
+    const caption = generateCaption(news_data, hashtags);
+    
     const result = await pool.query(
-      `INSERT INTO carousel_posts (title, week_start, week_end, slides, raw_news, cover_image_prompt) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [`Göçmenlik Haberleri - ${news_data.weekRange}`, news_data.weekStart, news_data.weekEnd, JSON.stringify(slides), JSON.stringify(news_data), generateCoverPrompt(news_data)]
+      `INSERT INTO carousel_posts (title, week_start, week_end, slides, raw_news, cover_image_prompt, tenant_id, caption) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [`Göçmenlik Haberleri - ${news_data.weekRange}`, news_data.weekStart, news_data.weekEnd, JSON.stringify(slides), JSON.stringify(news_data), generateCoverPrompt(news_data), tenant_id || null, caption]
     );
     
     res.status(201).json({ success: true, carousel: result.rows[0], slides_count: slides.length });
   } catch (error) { console.error('Carousel generate error:', error); res.status(500).json({ error: error.message }); }
 });
 
-function parseOpenAIContent(content, rawNews) {
+function createSlidesWithBrand(rawNews, brandName) {
   const slides = [];
-  slides.push({ type: 'cover', title: 'Türkiye Göçmenlik Haberleri', subtitle: rawNews.weekRange, brand: 'ATASA', image_placeholder: true });
-  slides.push({ type: 'intro', greeting: 'Merhaba,', content: `Bu hafta Göçmenlik Haberleri serisinde, Türkiye'deki göçmenlik mevzuatı ve uygulamalarındaki son gelişmeleri sizin için derledik.\n\nOturma izni düzenlemelerinden çalışma izni kolaylıklarına, vatandaşlık güncellemelerinden vize haberlerine kadar bu sayıda haberdar olmanız gereken birçok yeni gelişme sizi bekliyor.\n\nKeyifli okumalar ☕`, brand: 'ATASA' });
+  slides.push({ type: 'cover', title: 'Türkiye Göçmenlik Haberleri', subtitle: rawNews.weekRange, brand: brandName, image_placeholder: true });
+  slides.push({ type: 'intro', greeting: 'Merhaba,', content: `Bu hafta Göçmenlik Haberleri serisinde, Türkiye'deki göçmenlik mevzuatı ve uygulamalarındaki son gelişmeleri sizin için derledik.\n\nOturma izni düzenlemelerinden çalışma izni kolaylıklarına, vatandaşlık güncellemelerinden vize haberlerine kadar bu sayıda haberdar olmanız gereken birçok yeni gelişme sizi bekliyor.\n\nKeyifli okumalar ☕`, brand: brandName });
   rawNews.categories.forEach(cat => {
-    slides.push({ type: 'category', emoji: cat.emoji, category: cat.name, items: cat.news.map(n => ({ text: n.title, source: n.source, url: n.url })), brand: 'ATASA' });
+    slides.push({ type: 'category', emoji: cat.emoji, category: cat.name, items: cat.news.map(n => ({ text: n.title, source: n.source, url: n.url })), brand: brandName });
   });
   return slides;
 }
 
-function createBasicSlides(rawNews) { return parseOpenAIContent(null, rawNews); }
+function generateCaption(news, hashtags) {
+  const categoryCount = news.categories.length;
+  let caption = `📰 Türkiye Göçmenlik Haberleri - ${news.weekRange}\n\n`;
+  caption += `Bu hafta ${categoryCount} farklı kategoride güncel haberler sizlerle!\n\n`;
+  news.categories.forEach(cat => { caption += `${cat.emoji} ${cat.name}\n`; });
+  caption += `\n📌 Kaydırarak tüm haberleri görüntüleyin!\n\n`;
+  caption += hashtags || '#göçmenlik #türkiye #oturmaiizni #çalışmaizni #vize #vatandaşlık';
+  return caption;
+}
 
 function generateCoverPrompt(news) {
   return `Minimalist black and white illustration for Instagram carousel cover. Theme: Immigration and travel in Turkey. Style: Clean line art, similar to modern editorial illustrations. Elements: Two people - one holding documents/passport, another with a suitcase or looking at a phone. No text in the image itself. Professional, friendly, and approachable mood.`;
@@ -228,6 +410,37 @@ function generateCoverPrompt(news) {
 
 // Setup carousel render routes (PNG/ZIP generation)
 setupCarouselRenderRoutes(app, pool);
+
+// Setup Instagram routes (OAuth + Publishing)
+setupInstagramRoutes(app, pool);
+
+// =====================
+// SCHEDULED POST CHECKER
+// =====================
+async function checkScheduledCarouselPosts() {
+  try {
+    const result = await pool.query(
+      `SELECT sp.*, c.slides, t.ig_access_token, t.ig_user_id, t.default_hashtags
+       FROM ig_scheduled_posts sp
+       JOIN carousel_posts c ON sp.carousel_id = c.id
+       JOIN ig_tenants t ON sp.tenant_id = t.id
+       WHERE sp.status = 'pending' AND sp.scheduled_at <= NOW()`
+    );
+    
+    for (const post of result.rows) {
+      if (!post.ig_access_token || !post.ig_user_id) {
+        await pool.query(`UPDATE ig_scheduled_posts SET status = 'failed', error_message = 'Instagram not connected' WHERE id = $1`, [post.id]);
+        continue;
+      }
+      
+      console.log(`📸 Publishing scheduled carousel ${post.carousel_id}...`);
+      // TODO: Call Instagram publish function
+    }
+  } catch (error) { console.error('Scheduled post check error:', error); }
+}
+
+// Check scheduled posts every minute
+setInterval(checkScheduledCarouselPosts, 60000);
 
 // =====================
 // CRON JOB - Auto Video Scanner
@@ -370,7 +583,12 @@ setInterval(async () => {
   } catch (error) { console.error('Auto-scan check error:', error); }
 }, 60 * 60 * 1000);
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'Atasa Blog API', audioProcessor: AUDIO_PROCESSOR_URL }));
+app.get('/', (req, res) => res.json({ 
+  status: 'ok', 
+  message: 'Atasa Blog API - Instagram Carousel SaaS', 
+  version: '2.0.0',
+  features: ['blog', 'youtube', 'carousel', 'instagram-publish', 'multi-tenant']
+}));
 
 // ===================== AUTH =====================
 app.post('/api/auth/verify', async (req, res) => { try { const { email } = req.body; if (!email) return res.status(400).json({ error: 'Email required' }); const result = await pool.query('SELECT * FROM allowed_users WHERE email = $1', [email.toLowerCase()]); res.json(result.rows.length > 0 ? { allowed: true, user: result.rows[0] } : { allowed: false }); } catch (error) { res.status(500).json({ error: 'Internal server error' }); } });
@@ -409,9 +627,11 @@ app.delete('/api/posts/:id', async (req, res) => { try { const result = await po
 function formatPost(row) { return { id: row.id.toString(), title: row.title, slug: row.slug, content: row.content, category: row.category, excerpt: row.excerpt, thumbnail: row.thumbnail, date: row.date, readTime: row.read_time, status: row.status, scheduledAt: row.scheduled_at, publishedAt: row.published_at, videoId: row.video_id, createdAt: row.created_at, updatedAt: row.updated_at }; }
 
 app.listen(PORT, async () => {
-  console.log(`🚀 Atasa Blog API on port ${PORT}`);
+  console.log(`🚀 Atasa Blog API v2.0.0 on port ${PORT}`);
   console.log(`📡 Audio Processor: ${AUDIO_PROCESSOR_URL}`);
-  console.log(`🎨 Carousel render available at /api/carousel/:id/render-zip`);
+  console.log(`🎨 Carousel render: /api/carousel/:id/render-zip`);
+  console.log(`📸 Instagram publish: /api/instagram/publish/:carouselId`);
+  console.log(`👥 Multi-tenant: /api/tenants`);
   await initDB();
   setTimeout(() => { autoScanVideos(); }, 10000);
 });
