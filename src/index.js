@@ -2,7 +2,13 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import 'dotenv/config';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
+const execAsync = promisify(exec);
 const { Pool } = pg;
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -122,124 +128,51 @@ app.put('/api/youtube/videos/:id/transcript', async (req, res) => {
 });
 
 // =====================
-// AUDIO EXTRACTION - Multiple Methods
+// AUDIO EXTRACTION with yt-dlp
 // =====================
 
 async function getYouTubeAudioUrl(videoId) {
   console.log(`🎵 Getting audio URL for: ${videoId}`);
   const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
   
-  // Yöntem 1: y2mate.nu API
+  // yt-dlp ile direkt audio URL al (indirmeden)
   try {
-    console.log('Trying y2mate...');
-    const analyzeRes = await fetch('https://www.y2mate.nu/api/convert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `url=${encodeURIComponent(youtubeUrl)}&task=download&filetypes=mp3`
-    });
-    const data = await analyzeRes.json();
-    if (data.download_url) { 
-      console.log('✅ y2mate success'); 
-      return data.download_url; 
+    console.log('Using yt-dlp to get audio URL...');
+    const { stdout } = await execAsync(`yt-dlp -f bestaudio --get-url "${youtubeUrl}"`, { timeout: 60000 });
+    const audioUrl = stdout.trim();
+    if (audioUrl && audioUrl.startsWith('http')) {
+      console.log('✅ yt-dlp success - got direct URL');
+      return audioUrl;
     }
-  } catch (e) { console.log('y2mate failed:', e.message); }
+  } catch (e) { 
+    console.log('yt-dlp direct URL failed:', e.message); 
+  }
   
-  // Yöntem 2: loader.to API
+  // Fallback: Dosyaya indir ve base64 olarak döndür (küçük dosyalar için)
   try {
-    console.log('Trying loader.to...');
-    const loaderRes = await fetch(`https://loader.to/api/button/?url=${encodeURIComponent(youtubeUrl)}&f=mp3`);
-    const html = await loaderRes.text();
-    const match = html.match(/href="(https:\/\/[^"]+)"/);
-    if (match && match[1]) { 
-      console.log('✅ loader.to success'); 
-      return match[1]; 
+    console.log('Trying yt-dlp download fallback...');
+    const tempDir = os.tmpdir();
+    const outputPath = path.join(tempDir, `${videoId}.mp3`);
+    
+    // Önce varsa eski dosyayı sil
+    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    
+    await execAsync(`yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 192K -o "${outputPath}" "${youtubeUrl}"`, { timeout: 120000 });
+    
+    if (fs.existsSync(outputPath)) {
+      // Dosya boyutunu kontrol et
+      const stats = fs.statSync(outputPath);
+      console.log(`✅ Downloaded MP3: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+      
+      // Dosyayı data URL olarak döndür (AssemblyAI file upload yapabiliriz)
+      // Ama bu büyük dosyalar için pratik değil, o yüzden geçici bir çözüm
+      return `file://${outputPath}`;
     }
-  } catch (e) { console.log('loader.to failed:', e.message); }
+  } catch (e) { 
+    console.log('yt-dlp download failed:', e.message); 
+  }
   
-  // Yöntem 3: ssyoutube API
-  try {
-    console.log('Trying ssyoutube...');
-    const ssRes = await fetch(`https://ssyoutube.com/api/convert?url=${encodeURIComponent(youtubeUrl)}`);
-    const ssData = await ssRes.json();
-    if (ssData.url) { 
-      console.log('✅ ssyoutube success'); 
-      return ssData.url; 
-    }
-  } catch (e) { console.log('ssyoutube failed:', e.message); }
-  
-  // Yöntem 4: 9convert
-  try {
-    console.log('Trying 9convert...');
-    const convertRes = await fetch('https://9convert.com/api/ajaxSearch/index', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `query=${encodeURIComponent(youtubeUrl)}&vt=mp3`
-    });
-    const convertData = await convertRes.json();
-    if (convertData.links?.mp3) {
-      const mp3Links = Object.values(convertData.links.mp3);
-      if (mp3Links[0]?.k) {
-        const convertRes2 = await fetch('https://9convert.com/api/ajaxConvert/convert', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: `vid=${convertData.vid}&k=${encodeURIComponent(mp3Links[0].k)}`
-        });
-        const convertData2 = await convertRes2.json();
-        if (convertData2.dlink) {
-          console.log('✅ 9convert success');
-          return convertData2.dlink;
-        }
-      }
-    }
-  } catch (e) { console.log('9convert failed:', e.message); }
-  
-  // Yöntem 5: yt1s
-  try {
-    console.log('Trying yt1s...');
-    const yt1sRes = await fetch('https://www.yt1s.com/api/ajaxSearch/index', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `q=${encodeURIComponent(youtubeUrl)}&vt=mp3`
-    });
-    const yt1sData = await yt1sRes.json();
-    if (yt1sData.links?.mp3) {
-      const mp3Links = Object.values(yt1sData.links.mp3);
-      if (mp3Links[0]?.k) {
-        const yt1sRes2 = await fetch('https://www.yt1s.com/api/ajaxConvert/convert', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: `vid=${yt1sData.vid}&k=${encodeURIComponent(mp3Links[0].k)}`
-        });
-        const yt1sData2 = await yt1sRes2.json();
-        if (yt1sData2.dlink) {
-          console.log('✅ yt1s success');
-          return yt1sData2.dlink;
-        }
-      }
-    }
-  } catch (e) { console.log('yt1s failed:', e.message); }
-
-  // Yöntem 6: vevioz (eski)
-  try {
-    console.log('Trying vevioz...');
-    const analyzeRes = await fetch(`https://api.vevioz.com/api/button/mp3/${videoId}`);
-    const html = await analyzeRes.text();
-    const match = html.match(/href="(https:\/\/[^"]+\.mp3[^"]*)"/);
-    if (match) { console.log('✅ Vevioz success'); return match[1]; }
-  } catch (e) { console.log('Vevioz failed:', e.message); }
-  
-  // Yöntem 7: mp3download.to
-  try {
-    console.log('Trying mp3download.to...');
-    const mp3Res = await fetch(`https://mp3download.to/api/v1/download?url=${encodeURIComponent(youtubeUrl)}`);
-    const mp3Data = await mp3Res.json();
-    if (mp3Data.downloadUrl) {
-      console.log('✅ mp3download.to success');
-      return mp3Data.downloadUrl;
-    }
-  } catch (e) { console.log('mp3download.to failed:', e.message); }
-  
-  throw new Error('Tüm audio extraction yöntemleri başarısız oldu');
+  throw new Error('Audio URL alınamadı');
 }
 
 // MP3'e çevir endpoint
@@ -266,8 +199,30 @@ app.post('/api/youtube/videos/:id/extract-audio', async (req, res) => {
 });
 
 // =====================
-// TRANSCRIPTION
+// TRANSCRIPTION with AssemblyAI
 // =====================
+
+async function uploadAudioToAssemblyAI(filePath, apiKey) {
+  console.log(`📤 Uploading audio file to AssemblyAI...`);
+  const fileData = fs.readFileSync(filePath);
+  
+  const response = await fetch('https://api.assemblyai.com/v2/upload', {
+    method: 'POST',
+    headers: {
+      'Authorization': apiKey,
+      'Content-Type': 'application/octet-stream',
+      'Transfer-Encoding': 'chunked'
+    },
+    body: fileData
+  });
+  
+  const data = await response.json();
+  if (data.upload_url) {
+    console.log('✅ Upload successful');
+    return data.upload_url;
+  }
+  throw new Error('Upload failed: ' + JSON.stringify(data));
+}
 
 app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
   try {
@@ -278,43 +233,53 @@ app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
     const videoResult = await pool.query('SELECT * FROM youtube_videos WHERE id = $1', [videoId]);
     if (videoResult.rows.length === 0) return res.status(404).json({ error: 'Video not found' });
     
-    const video = videoResult.rows[0];
-    
-    await pool.query(`UPDATE youtube_videos SET transcript_status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
+    await pool.query(`UPDATE youtube_videos SET transcript_status = 'processing', audio_status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
     res.json({ success: true, status: 'processing' });
     
     (async () => {
       try {
-        let audioUrl = video.audio_url;
-        if (!audioUrl || video.audio_status !== 'completed') {
-          console.log(`🎵 Extracting audio for ${videoId}...`);
-          await pool.query(`UPDATE youtube_videos SET audio_status = 'processing' WHERE id = $1`, [videoId]);
-          audioUrl = await getYouTubeAudioUrl(videoId);
-          await pool.query(`UPDATE youtube_videos SET audio_url = $1, audio_status = 'completed' WHERE id = $2`, [audioUrl, videoId]);
-          console.log(`✅ Audio URL obtained: ${audioUrl.substring(0, 50)}...`);
+        const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        const tempDir = os.tmpdir();
+        const outputPath = path.join(tempDir, `${videoId}.mp3`);
+        
+        // 1. yt-dlp ile MP3 indir
+        console.log(`🎵 Downloading audio for ${videoId}...`);
+        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        
+        await execAsync(`yt-dlp -f bestaudio -x --audio-format mp3 --audio-quality 128K -o "${outputPath}" "${youtubeUrl}"`, { timeout: 180000 });
+        
+        if (!fs.existsSync(outputPath)) {
+          throw new Error('MP3 dosyası oluşturulamadı');
         }
         
-        console.log(`🎙️ Starting transcription for ${videoId}...`);
+        const stats = fs.statSync(outputPath);
+        console.log(`✅ Downloaded MP3: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
         
+        await pool.query(`UPDATE youtube_videos SET audio_status = 'completed' WHERE id = $1`, [videoId]);
+        
+        // 2. AssemblyAI'a yükle
+        console.log(`📤 Uploading to AssemblyAI...`);
+        const uploadUrl = await uploadAudioToAssemblyAI(outputPath, apiKey);
+        
+        // 3. Transkripsiyon başlat
+        console.log(`🎙️ Starting transcription...`);
         const submitResponse = await fetch('https://api.assemblyai.com/v2/transcript', {
           method: 'POST',
           headers: { 'Authorization': apiKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ audio_url: audioUrl, language_code: 'tr' })
+          body: JSON.stringify({ audio_url: uploadUrl, language_code: 'tr' })
         });
         
         const submitData = await submitResponse.json();
-        console.log('AssemblyAI response:', JSON.stringify(submitData));
-        
         if (submitData.error) throw new Error(submitData.error);
         
         const transcriptId = submitData.id;
-        await pool.query(`UPDATE youtube_videos SET transcript_job_id = $1 WHERE id = $2`, [transcriptId, videoId]);
-        
+        await pool.query(`UPDATE youtube_videos SET transcript_job_id = $1, audio_url = $2 WHERE id = $3`, [transcriptId, uploadUrl, videoId]);
         console.log(`📝 Transcript job started: ${transcriptId}`);
         
+        // 4. Polling ile sonucu bekle
         let completed = false;
         let attempts = 0;
-        const maxAttempts = 60; // 5 dakika max
+        const maxAttempts = 120; // 10 dakika max
         
         while (!completed && attempts < maxAttempts) {
           await new Promise(r => setTimeout(r, 5000));
@@ -325,7 +290,7 @@ app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
           });
           const checkData = await checkResponse.json();
           
-          console.log(`Polling ${attempts}: status = ${checkData.status}`);
+          if (attempts % 6 === 0) console.log(`Polling ${attempts}: status = ${checkData.status}`);
           
           if (checkData.status === 'completed') {
             completed = true;
@@ -336,9 +301,11 @@ app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
           }
         }
         
-        if (!completed) {
-          throw new Error('Transcription timeout');
-        }
+        // Temizlik
+        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        
+        if (!completed) throw new Error('Transcription timeout');
+        
       } catch (error) {
         console.error(`❌ Transcription failed for ${videoId}:`, error.message);
         await pool.query(`UPDATE youtube_videos SET transcript_status = 'failed', audio_status = CASE WHEN audio_status = 'processing' THEN 'failed' ELSE audio_status END, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
