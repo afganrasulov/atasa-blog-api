@@ -1,6 +1,5 @@
 import puppeteer from 'puppeteer';
 import archiver from 'archiver';
-import { Readable } from 'stream';
 
 // HTML Template Generator for Instagram Carousel Slides
 export function generateSlideHTML(slide, brandLogo = null) {
@@ -106,10 +105,6 @@ export function generateSlideHTML(slide, brandLogo = null) {
             color: #0066FF;
             font-weight: 500;
           }
-          .coffee {
-            margin-top: 40px;
-            font-size: 32px;
-          }
         </style>
         <p class="greeting">${slide.greeting}</p>
         <p class="content">${slide.content.replace(/\n/g, '<br>').replace('Pazarlama Notları', '<span class="highlight">Göçmenlik Haberleri</span>')}</p>
@@ -129,17 +124,9 @@ export function generateSlideHTML(slide, brandLogo = null) {
             gap: 16px;
             margin-bottom: 48px;
           }
-          .emoji {
-            font-size: 48px;
-          }
-          .category-title {
-            font-size: 42px;
-            font-weight: 700;
-            color: #000;
-          }
-          .items {
-            flex: 1;
-          }
+          .emoji { font-size: 48px; }
+          .category-title { font-size: 42px; font-weight: 700; color: #000; }
+          .items { flex: 1; }
           .item {
             display: flex;
             align-items: flex-start;
@@ -148,9 +135,7 @@ export function generateSlideHTML(slide, brandLogo = null) {
             padding-bottom: 32px;
             border-bottom: 1px solid #eee;
           }
-          .item:last-child {
-            border-bottom: none;
-          }
+          .item:last-child { border-bottom: none; }
           .bullet {
             width: 8px;
             height: 8px;
@@ -159,19 +144,9 @@ export function generateSlideHTML(slide, brandLogo = null) {
             margin-top: 12px;
             flex-shrink: 0;
           }
-          .item-content {
-            flex: 1;
-          }
-          .item-text {
-            font-size: 26px;
-            line-height: 1.5;
-            color: #000;
-            margin-bottom: 8px;
-          }
-          .item-source {
-            font-size: 20px;
-            color: #0066FF;
-          }
+          .item-content { flex: 1; }
+          .item-text { font-size: 26px; line-height: 1.5; color: #000; margin-bottom: 8px; }
+          .item-source { font-size: 20px; color: #0066FF; }
         </style>
         <div class="header">
           <span class="emoji">${slide.emoji}</span>
@@ -208,7 +183,8 @@ export function generateSlideHTML(slide, brandLogo = null) {
 export async function renderSlidesToImages(slides) {
   const browser = await puppeteer.launch({
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
   });
 
   const images = [];
@@ -225,10 +201,7 @@ export async function renderSlidesToImages(slides) {
       // Wait for fonts to load
       await page.evaluate(() => document.fonts.ready);
       
-      const imageBuffer = await page.screenshot({ 
-        type: 'png',
-        encoding: 'binary'
-      });
+      const imageBuffer = await page.screenshot({ type: 'png', encoding: 'binary' });
       
       images.push({
         filename: `slide_${String(i + 1).padStart(2, '0')}_${slide.type}.png`,
@@ -256,20 +229,9 @@ export async function createImagesZip(images, weekRange) {
     archive.on('end', () => resolve(Buffer.concat(chunks)));
     archive.on('error', reject);
 
-    // Add each image to the archive
-    images.forEach(img => {
-      archive.append(img.buffer, { name: img.filename });
-    });
+    images.forEach(img => archive.append(img.buffer, { name: img.filename }));
 
-    // Add a readme file
-    const readme = `Instagram Carousel - ${weekRange}
-Generated: ${new Date().toISOString()}
-
-Files:
-${images.map(img => `- ${img.filename}`).join('\n')}
-
-Note: Replace slide_01_cover.png illustration with Gemini AI generated image.
-`;
+    const readme = `Instagram Carousel - ${weekRange}\nGenerated: ${new Date().toISOString()}\n\nFiles:\n${images.map(img => `- ${img.filename}`).join('\n')}\n\nNote: Replace slide_01_cover.png illustration with Gemini AI generated image.\n`;
     archive.append(readme, { name: 'README.txt' });
 
     archive.finalize();
@@ -283,27 +245,19 @@ export function setupCarouselRenderRoutes(app, pool) {
   app.get('/api/carousel/:id/render/:slideNumber', async (req, res) => {
     try {
       const { id, slideNumber } = req.params;
-      
       const result = await pool.query('SELECT * FROM carousel_posts WHERE id = $1', [id]);
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'Carousel not found' });
-      }
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Carousel not found' });
       
       const carousel = result.rows[0];
       const slides = typeof carousel.slides === 'string' ? JSON.parse(carousel.slides) : carousel.slides;
       const slideIndex = parseInt(slideNumber) - 1;
       
-      if (slideIndex < 0 || slideIndex >= slides.length) {
-        return res.status(404).json({ error: 'Slide not found' });
-      }
+      if (slideIndex < 0 || slideIndex >= slides.length) return res.status(404).json({ error: 'Slide not found' });
       
-      const slide = slides[slideIndex];
-      const images = await renderSlidesToImages([slide]);
-      
+      const images = await renderSlidesToImages([slides[slideIndex]]);
       res.set('Content-Type', 'image/png');
       res.set('Content-Disposition', `inline; filename="slide_${slideNumber}.png"`);
       res.send(images[0].buffer);
-      
     } catch (error) {
       console.error('Render error:', error);
       res.status(500).json({ error: error.message });
@@ -314,11 +268,8 @@ export function setupCarouselRenderRoutes(app, pool) {
   app.get('/api/carousel/:id/render-zip', async (req, res) => {
     try {
       const { id } = req.params;
-      
       const result = await pool.query('SELECT * FROM carousel_posts WHERE id = $1', [id]);
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'Carousel not found' });
-      }
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Carousel not found' });
       
       const carousel = result.rows[0];
       const slides = typeof carousel.slides === 'string' ? JSON.parse(carousel.slides) : carousel.slides;
@@ -327,7 +278,6 @@ export function setupCarouselRenderRoutes(app, pool) {
       
       const images = await renderSlidesToImages(slides);
       const zipBuffer = await createImagesZip(images, carousel.title);
-      
       const filename = `carousel_${id}_${Date.now()}.zip`;
       
       res.set('Content-Type', 'application/zip');
@@ -336,7 +286,6 @@ export function setupCarouselRenderRoutes(app, pool) {
       res.send(zipBuffer);
       
       console.log(`✅ ZIP created: ${filename} (${images.length} images)`);
-      
     } catch (error) {
       console.error('ZIP render error:', error);
       res.status(500).json({ error: error.message });
@@ -347,16 +296,12 @@ export function setupCarouselRenderRoutes(app, pool) {
   app.post('/api/carousel/render', async (req, res) => {
     try {
       const { slides, weekRange } = req.body;
-      
-      if (!slides || !Array.isArray(slides)) {
-        return res.status(400).json({ error: 'slides array required' });
-      }
+      if (!slides || !Array.isArray(slides)) return res.status(400).json({ error: 'slides array required' });
       
       console.log(`🎨 Rendering ${slides.length} slides from webhook...`);
       
       const images = await renderSlidesToImages(slides);
       const zipBuffer = await createImagesZip(images, weekRange || 'carousel');
-      
       const filename = `carousel_${Date.now()}.zip`;
       
       res.set('Content-Type', 'application/zip');
@@ -365,7 +310,6 @@ export function setupCarouselRenderRoutes(app, pool) {
       res.send(zipBuffer);
       
       console.log(`✅ ZIP created: ${filename} (${images.length} images)`);
-      
     } catch (error) {
       console.error('Render error:', error);
       res.status(500).json({ error: error.message });
@@ -376,24 +320,17 @@ export function setupCarouselRenderRoutes(app, pool) {
   app.get('/api/carousel/:id/preview/:slideNumber', async (req, res) => {
     try {
       const { id, slideNumber } = req.params;
-      
       const result = await pool.query('SELECT * FROM carousel_posts WHERE id = $1', [id]);
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'Carousel not found' });
-      }
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Carousel not found' });
       
       const carousel = result.rows[0];
       const slides = typeof carousel.slides === 'string' ? JSON.parse(carousel.slides) : carousel.slides;
       const slideIndex = parseInt(slideNumber) - 1;
       
-      if (slideIndex < 0 || slideIndex >= slides.length) {
-        return res.status(404).json({ error: 'Slide not found' });
-      }
+      if (slideIndex < 0 || slideIndex >= slides.length) return res.status(404).json({ error: 'Slide not found' });
       
-      const html = generateSlideHTML(slides[slideIndex]);
       res.set('Content-Type', 'text/html');
-      res.send(html);
-      
+      res.send(generateSlideHTML(slides[slideIndex]));
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
