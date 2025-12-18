@@ -16,11 +16,12 @@ const pool = new Pool({
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 // Initialize database tables
 async function initDB() {
   try {
+    // Posts table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS posts (
         id SERIAL PRIMARY KEY,
@@ -40,6 +41,7 @@ async function initDB() {
       )
     `);
 
+    // Settings table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS settings (
         key VARCHAR(100) PRIMARY KEY,
@@ -47,11 +49,56 @@ async function initDB() {
       )
     `);
 
+    // YouTube videos cache table
     await pool.query(`
-      INSERT INTO settings (key, value) 
-      VALUES ('autopilot', 'false') 
-      ON CONFLICT (key) DO NOTHING
+      CREATE TABLE IF NOT EXISTS youtube_videos (
+        id VARCHAR(50) PRIMARY KEY,
+        title VARCHAR(500),
+        description TEXT,
+        thumbnail VARCHAR(500),
+        duration INTEGER,
+        view_count INTEGER,
+        published_at TIMESTAMP,
+        channel_id VARCHAR(50),
+        video_type VARCHAR(20) DEFAULT 'video',
+        transcript TEXT,
+        transcript_status VARCHAR(20) DEFAULT 'pending',
+        transcript_model VARCHAR(50),
+        transcript_updated_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
     `);
+
+    // Transcription jobs table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS transcription_jobs (
+        id SERIAL PRIMARY KEY,
+        video_id VARCHAR(50) REFERENCES youtube_videos(id),
+        status VARCHAR(20) DEFAULT 'pending',
+        model VARCHAR(50) DEFAULT 'base',
+        progress INTEGER DEFAULT 0,
+        error TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Allowed users table (for admin access)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS allowed_users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        name VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Insert default settings
+    await pool.query(`INSERT INTO settings (key, value) VALUES ('autopilot', 'false') ON CONFLICT (key) DO NOTHING`);
+    
+    // Insert default allowed user
+    await pool.query(`INSERT INTO allowed_users (email, name) VALUES ('afganrasulov@gmail.com', 'Afgan Rasulov') ON CONFLICT (email) DO NOTHING`);
 
     console.log('✅ Database initialized');
   } catch (error) {
@@ -72,9 +119,7 @@ function generateSlug(title) {
 }
 
 function formatDateTR() {
-  return new Date().toLocaleDateString('tr-TR', { 
-    day: 'numeric', month: 'long', year: 'numeric' 
-  });
+  return new Date().toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', year: 'numeric' });
 }
 
 function calculateReadTime(content) {
@@ -90,7 +135,6 @@ async function checkScheduledPosts() {
       WHERE status = 'scheduled' AND scheduled_at <= CURRENT_TIMESTAMP
       RETURNING title
     `, [formatDateTR()]);
-    
     result.rows.forEach(post => console.log(`📅 Published: ${post.title}`));
   } catch (error) {
     console.error('Schedule check error:', error);
@@ -101,203 +145,250 @@ setInterval(checkScheduledPosts, 60000);
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'Atasa Blog API (PostgreSQL)',
-    endpoints: [
-      'GET /api/posts', 'GET /api/posts/all', 'GET /api/posts/:slug',
-      'POST /api/posts', 'PUT /api/posts/:id', 'DELETE /api/posts/:id',
-      'GET /api/youtube/transcript/:videoId'
-    ]
-  });
+  res.json({ status: 'ok', message: 'Atasa Blog API' });
 });
 
 // =====================
-// YOUTUBE TRANSCRIPT - Multiple methods
+// AUTH - Check allowed users
 // =====================
 
-async function fetchTranscriptMethod1(videoId) {
-  // Method 1: Direct YouTube innertube API
-  const response = await fetch('https://www.youtube.com/youtubei/v1/get_transcript?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      context: {
-        client: {
-          clientName: 'WEB',
-          clientVersion: '2.20231219.04.00'
-        }
-      },
-      params: Buffer.from(`\n\x0b${videoId}`).toString('base64')
-    })
-  });
-  
-  if (!response.ok) throw new Error('Innertube API failed');
-  
-  const data = await response.json();
-  
-  // Extract transcript from response
-  const transcriptRenderer = data?.actions?.[0]?.updateEngagementPanelAction?.content?.transcriptRenderer;
-  const cueGroups = transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body?.transcriptSegmentListRenderer?.initialSegments
-    || transcriptRenderer?.body?.transcriptSegmentListRenderer?.initialSegments
-    || [];
-  
-  if (cueGroups.length === 0) throw new Error('No transcript in innertube response');
-  
-  const segments = cueGroups
-    .map(seg => seg?.transcriptSegmentRenderer?.snippet?.runs?.[0]?.text)
-    .filter(text => text);
-  
-  return segments;
-}
-
-async function fetchTranscriptMethod2(videoId) {
-  // Method 2: Scrape from YouTube watch page
-  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const response = await fetch(watchUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-      'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8'
+app.post('/api/auth/verify', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    
+    const result = await pool.query('SELECT * FROM allowed_users WHERE email = $1', [email.toLowerCase()]);
+    
+    if (result.rows.length > 0) {
+      res.json({ allowed: true, user: result.rows[0] });
+    } else {
+      res.json({ allowed: false });
     }
-  });
-  
-  if (!response.ok) throw new Error('Failed to fetch YouTube page');
-  
-  const html = await response.text();
-  
-  // Find timedtext URL in the page
-  const patterns = [
-    /"baseUrl"\s*:\s*"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/g,
-    /"captionTracks"\s*:\s*\[\s*\{[^}]*"baseUrl"\s*:\s*"([^"]+)"/g
-  ];
-  
-  let captionUrl = null;
-  
-  for (const pattern of patterns) {
-    const matches = [...html.matchAll(pattern)];
-    for (const match of matches) {
-      const url = match[1].replace(/\\u0026/g, '&').replace(/\\"/g, '"');
-      if (url.includes('lang=tr')) {
-        captionUrl = url;
-        break;
-      }
-      if (!captionUrl) captionUrl = url;
-    }
-    if (captionUrl) break;
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
   }
-  
-  if (!captionUrl) throw new Error('No caption URL found');
-  
-  // Fetch the captions
-  const captionResponse = await fetch(captionUrl);
-  if (!captionResponse.ok) throw new Error('Failed to fetch captions');
-  
-  const captionText = await captionResponse.text();
-  
-  // Parse XML or JSON
-  let segments = [];
-  
-  if (captionText.includes('<transcript>') || captionText.includes('<text')) {
-    // XML format
-    const textMatches = [...captionText.matchAll(/<text[^>]*>([^<]*)<\/text>/g)];
-    segments = textMatches.map(m => decodeHTMLEntities(m[1])).filter(t => t.trim());
-  } else {
-    // Try JSON format
-    try {
-      const json = JSON.parse(captionText);
-      segments = (json.events || [])
-        .filter(e => e.segs)
-        .flatMap(e => e.segs.map(s => s.utf8))
-        .filter(t => t && t.trim());
-    } catch {
-      throw new Error('Unknown caption format');
-    }
+});
+
+app.get('/api/auth/users', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM allowed_users ORDER BY created_at');
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
   }
-  
-  return segments;
-}
+});
 
-async function fetchTranscriptMethod3(videoId) {
-  // Method 3: Use a third-party transcript service
-  const response = await fetch(`https://yt.lemnoslife.com/videos?part=transcript&id=${videoId}`);
-  
-  if (!response.ok) throw new Error('Third-party API failed');
-  
-  const data = await response.json();
-  const transcript = data?.items?.[0]?.transcript?.content;
-  
-  if (!transcript || transcript.length === 0) throw new Error('No transcript from third-party');
-  
-  return transcript.map(item => item.text).filter(t => t);
-}
-
-function decodeHTMLEntities(text) {
-  return text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&apos;/g, "'")
-    .replace(/\\n/g, ' ')
-    .replace(/\n/g, ' ');
-}
-
-app.get('/api/youtube/transcript/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  console.log(`📺 Fetching transcript for: ${videoId}`);
-  
-  const methods = [
-    { name: 'Method3-ThirdParty', fn: () => fetchTranscriptMethod3(videoId) },
-    { name: 'Method2-Scrape', fn: () => fetchTranscriptMethod2(videoId) },
-    { name: 'Method1-Innertube', fn: () => fetchTranscriptMethod1(videoId) }
-  ];
-  
-  let lastError = null;
-  
-  for (const method of methods) {
-    try {
-      console.log(`  Trying ${method.name}...`);
-      const segments = await method.fn();
-      
-      if (segments && segments.length > 0) {
-        const fullText = segments
-          .join(' ')
-          .replace(/\[.*?\]/g, '')
-          .replace(/\s+/g, ' ')
-          .trim();
-        
-        if (fullText.length > 10) {
-          console.log(`✅ Success with ${method.name}: ${segments.length} segments`);
-          
-          return res.json({
-            success: true,
-            videoId,
-            method: method.name,
-            transcript: fullText,
-            segments,
-            segmentCount: segments.length,
-            characterCount: fullText.length,
-            wordCount: fullText.split(/\s+/).filter(w => w).length
-          });
-        }
-      }
-    } catch (error) {
-      console.log(`  ${method.name} failed: ${error.message}`);
-      lastError = error;
-    }
+app.post('/api/auth/users', async (req, res) => {
+  try {
+    const { email, name } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    
+    const result = await pool.query(
+      'INSERT INTO allowed_users (email, name) VALUES ($1, $2) ON CONFLICT (email) DO UPDATE SET name = $2 RETURNING *',
+      [email.toLowerCase(), name || '']
+    );
+    res.json({ success: true, user: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
   }
-  
-  console.log(`❌ All methods failed for ${videoId}`);
-  
-  res.status(404).json({
-    success: false,
-    videoId,
-    error: 'Transcript not available',
-    message: lastError?.message || 'Bu video için altyazı bulunamadı. Video altyazısı kapalı veya mevcut olmayabilir.'
-  });
+});
+
+app.delete('/api/auth/users/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM allowed_users WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// =====================
+// YOUTUBE VIDEOS
+// =====================
+
+// Get all cached videos
+app.get('/api/youtube/videos', async (req, res) => {
+  try {
+    const { type } = req.query;
+    let query = 'SELECT * FROM youtube_videos';
+    let params = [];
+    
+    if (type) {
+      query += ' WHERE video_type = $1';
+      params.push(type);
+    }
+    query += ' ORDER BY published_at DESC';
+    
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Save/update videos (bulk)
+app.post('/api/youtube/videos', async (req, res) => {
+  try {
+    const { videos } = req.body;
+    if (!videos || !Array.isArray(videos)) {
+      return res.status(400).json({ error: 'Videos array required' });
+    }
+    
+    for (const video of videos) {
+      await pool.query(`
+        INSERT INTO youtube_videos (id, title, description, thumbnail, duration, view_count, published_at, channel_id, video_type)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (id) DO UPDATE SET
+          title = $2, description = $3, thumbnail = $4, duration = $5, 
+          view_count = $6, published_at = $7, updated_at = CURRENT_TIMESTAMP
+      `, [
+        video.id,
+        video.title,
+        video.description,
+        video.thumbnail,
+        video.duration,
+        video.viewCount,
+        video.publishedAt,
+        video.channelId,
+        video.type || 'video'
+      ]);
+    }
+    
+    res.json({ success: true, count: videos.length });
+  } catch (error) {
+    console.error('Save videos error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single video
+app.get('/api/youtube/videos/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM youtube_videos WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Video not found' });
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update video transcript
+app.put('/api/youtube/videos/:id/transcript', async (req, res) => {
+  try {
+    const { transcript, model, status } = req.body;
+    
+    await pool.query(`
+      UPDATE youtube_videos SET 
+        transcript = $1, 
+        transcript_model = $2, 
+        transcript_status = $3,
+        transcript_updated_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $4
+    `, [transcript, model, status || 'completed', req.params.id]);
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// =====================
+// TRANSCRIPTION JOBS
+// =====================
+
+// Get all jobs
+app.get('/api/transcription/jobs', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT j.*, v.title as video_title, v.thumbnail 
+      FROM transcription_jobs j 
+      JOIN youtube_videos v ON j.video_id = v.id 
+      ORDER BY j.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create job
+app.post('/api/transcription/jobs', async (req, res) => {
+  try {
+    const { videoId, model } = req.body;
+    if (!videoId) return res.status(400).json({ error: 'videoId required' });
+    
+    // Check if video exists
+    const videoCheck = await pool.query('SELECT id FROM youtube_videos WHERE id = $1', [videoId]);
+    if (videoCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Video not found' });
+    }
+    
+    // Check for existing pending job
+    const existingJob = await pool.query(
+      'SELECT * FROM transcription_jobs WHERE video_id = $1 AND status IN ($2, $3)',
+      [videoId, 'pending', 'processing']
+    );
+    
+    if (existingJob.rows.length > 0) {
+      return res.json({ success: true, job: existingJob.rows[0], existing: true });
+    }
+    
+    // Create new job
+    const result = await pool.query(`
+      INSERT INTO transcription_jobs (video_id, model, status)
+      VALUES ($1, $2, 'pending')
+      RETURNING *
+    `, [videoId, model || 'base']);
+    
+    // Update video status
+    await pool.query(
+      'UPDATE youtube_videos SET transcript_status = $1 WHERE id = $2',
+      ['processing', videoId]
+    );
+    
+    res.json({ success: true, job: result.rows[0] });
+  } catch (error) {
+    console.error('Create job error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update job status
+app.put('/api/transcription/jobs/:id', async (req, res) => {
+  try {
+    const { status, progress, error } = req.body;
+    
+    await pool.query(`
+      UPDATE transcription_jobs SET 
+        status = COALESCE($1, status),
+        progress = COALESCE($2, progress),
+        error = $3,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $4
+    `, [status, progress, error, req.params.id]);
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get pending jobs (for worker)
+app.get('/api/transcription/pending', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT j.*, v.title as video_title 
+      FROM transcription_jobs j 
+      JOIN youtube_videos v ON j.video_id = v.id 
+      WHERE j.status = 'pending'
+      ORDER BY j.created_at ASC
+      LIMIT 1
+    `);
+    res.json(result.rows[0] || null);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // =====================
@@ -309,7 +400,10 @@ app.get('/api/settings', async (req, res) => {
     const result = await pool.query('SELECT key, value FROM settings');
     const settings = {};
     result.rows.forEach(row => {
-      settings[row.key] = row.value === 'true';
+      // Parse boolean values
+      if (row.value === 'true') settings[row.key] = true;
+      else if (row.value === 'false') settings[row.key] = false;
+      else settings[row.key] = row.value;
     });
     res.json(settings);
   } catch (error) {
@@ -319,13 +413,19 @@ app.get('/api/settings', async (req, res) => {
 
 app.put('/api/settings', async (req, res) => {
   try {
-    const { autopilot } = req.body;
-    if (typeof autopilot === 'boolean') {
-      await pool.query('UPDATE settings SET value = $1 WHERE key = $2', [autopilot.toString(), 'autopilot']);
+    for (const [key, value] of Object.entries(req.body)) {
+      await pool.query(
+        'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2',
+        [key, String(value)]
+      );
     }
     const result = await pool.query('SELECT key, value FROM settings');
     const settings = {};
-    result.rows.forEach(row => settings[row.key] = row.value === 'true');
+    result.rows.forEach(row => {
+      if (row.value === 'true') settings[row.key] = true;
+      else if (row.value === 'false') settings[row.key] = false;
+      else settings[row.key] = row.value;
+    });
     res.json({ success: true, settings });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -452,7 +552,6 @@ app.put('/api/posts/:id/publish', async (req, res) => {
         scheduled_at = NULL, date = $1, updated_at = CURRENT_TIMESTAMP
       WHERE id = $2 RETURNING *
     `, [formatDateTR(), req.params.id]);
-    
     if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
     res.json({ success: true, post: formatPost(result.rows[0]) });
   } catch (error) {
@@ -464,12 +563,10 @@ app.put('/api/posts/:id/schedule', async (req, res) => {
   try {
     const { scheduledAt } = req.body;
     if (!scheduledAt) return res.status(400).json({ error: 'scheduledAt required' });
-    
     const result = await pool.query(`
       UPDATE posts SET status = 'scheduled', scheduled_at = $1, updated_at = CURRENT_TIMESTAMP
       WHERE id = $2 RETURNING *
     `, [scheduledAt, req.params.id]);
-    
     if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
     res.json({ success: true, post: formatPost(result.rows[0]) });
   } catch (error) {
@@ -483,7 +580,6 @@ app.put('/api/posts/:id/unpublish', async (req, res) => {
       UPDATE posts SET status = 'draft', published_at = NULL, scheduled_at = NULL, updated_at = CURRENT_TIMESTAMP
       WHERE id = $1 RETURNING *
     `, [req.params.id]);
-    
     if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
     res.json({ success: true, post: formatPost(result.rows[0]) });
   } catch (error) {
