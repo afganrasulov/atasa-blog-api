@@ -4,7 +4,6 @@ import pg from 'pg';
 import 'dotenv/config';
 
 const { Pool } = pg;
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -29,14 +28,12 @@ async function initDB() {
   } catch (error) { console.error('Database init error:', error); }
 }
 
-// Helpers
 function generateSlug(title) {
   return title.toLowerCase().replace(/ğ/g, 'g').replace(/ü/g, 'u').replace(/ş/g, 's').replace(/ı/g, 'i').replace(/ö/g, 'o').replace(/ç/g, 'c').replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').trim();
 }
 function formatDateTR() { return new Date().toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', year: 'numeric' }); }
 function calculateReadTime(content) { return Math.ceil(content.split(' ').length / 200) + ' dk okuma'; }
 
-// Scheduled posts check
 setInterval(async () => {
   try {
     const result = await pool.query(`UPDATE posts SET status = 'published', published_at = CURRENT_TIMESTAMP, date = $1 WHERE status = 'scheduled' AND scheduled_at <= CURRENT_TIMESTAMP RETURNING title`, [formatDateTR()]);
@@ -114,41 +111,85 @@ app.put('/api/youtube/videos/:id/transcript', async (req, res) => {
   } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// TRANSCRIPTION - OpenAI Whisper
-app.post('/api/transcribe/openai', async (req, res) => {
-  try {
-    const { videoId, apiKey } = req.body;
-    if (!videoId || !apiKey) return res.status(400).json({ error: 'videoId and apiKey required' });
+// =====================
+// TRANSCRIPTION - YouTube ses çıkarma + AssemblyAI
+// =====================
 
-    // YouTube'dan ses URL'si al (yt-dlp benzeri bir servis kullanacağız)
-    const infoRes = await fetch(`https://yt-api.p.rapidapi.com/dl?id=${videoId}`, {
-      headers: { 'X-RapidAPI-Key': '4e8b3f2a1dmsh8f3a2c1b4e5f6g7', 'X-RapidAPI-Host': 'yt-api.p.rapidapi.com' }
+// YouTube'dan ses URL'si al
+async function getYouTubeAudioUrl(videoId) {
+  console.log(`🎵 Getting audio URL for: ${videoId}`);
+  
+  // Yöntem 1: cobalt.tools API (ücretsiz, güvenilir)
+  try {
+    const cobaltRes = await fetch('https://co.wuk.sh/api/json', {
+      method: 'POST',
+      headers: { 
+        'Accept': 'application/json', 
+        'Content-Type': 'application/json' 
+      },
+      body: JSON.stringify({ 
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        isAudioOnly: true,
+        aFormat: 'mp3'
+      })
     });
     
-    // Alternatif: Doğrudan YouTube audio URL kullan
-    const audioUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const cobaltData = await cobaltRes.json();
+    console.log('Cobalt response:', cobaltData);
     
-    // OpenAI Whisper API - URL ile çalışmıyor, dosya gerekiyor
-    // Bu yüzden client-side'da yapılması gerekiyor
-    res.status(501).json({ error: 'OpenAI Whisper için client-side implementation gerekli. AssemblyAI kullanın.' });
-  } catch (error) {
-    console.error('OpenAI transcription error:', error);
-    res.status(500).json({ error: error.message });
+    if (cobaltData.url) {
+      return cobaltData.url;
+    }
+  } catch (e) {
+    console.log('Cobalt failed:', e.message);
   }
-});
+  
+  // Yöntem 2: y2mate benzeri API
+  try {
+    const analyzeRes = await fetch(`https://api.vevioz.com/api/button/mp3/${videoId}`);
+    const html = await analyzeRes.text();
+    const match = html.match(/href="(https:\/\/[^"]+\.mp3[^"]*)"/);
+    if (match) {
+      console.log('Vevioz found URL');
+      return match[1];
+    }
+  } catch (e) {
+    console.log('Vevioz failed:', e.message);
+  }
+  
+  // Yöntem 3: loader.to API
+  try {
+    const loaderRes = await fetch(`https://ab.cococococ.com/ajax/download.php?copyright=0&format=mp3&url=https://www.youtube.com/watch?v=${videoId}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`);
+    const loaderData = await loaderRes.json();
+    console.log('Loader response:', loaderData);
+    if (loaderData.download_url) {
+      return loaderData.download_url;
+    }
+  } catch (e) {
+    console.log('Loader failed:', e.message);
+  }
+  
+  throw new Error('Ses URL\'si alınamadı. Lütfen daha sonra tekrar deneyin.');
+}
 
-// TRANSCRIPTION - AssemblyAI (YouTube URL desteği var!)
+// AssemblyAI ile transkripsiyon başlat
 app.post('/api/transcribe/assemblyai', async (req, res) => {
   try {
     const { videoId, apiKey } = req.body;
     if (!videoId || !apiKey) return res.status(400).json({ error: 'videoId and apiKey required' });
 
-    // AssemblyAI doğrudan YouTube URL kabul ediyor!
+    console.log(`🎙️ Starting transcription for: ${videoId}`);
+    
+    // Önce ses URL'sini al
+    const audioUrl = await getYouTubeAudioUrl(videoId);
+    console.log(`✅ Audio URL: ${audioUrl.substring(0, 100)}...`);
+
+    // AssemblyAI'a gönder
     const submitResponse = await fetch('https://api.assemblyai.com/v2/transcript', {
       method: 'POST',
       headers: { 'Authorization': apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
-        audio_url: `https://www.youtube.com/watch?v=${videoId}`,
+        audio_url: audioUrl,
         language_code: 'tr'
       })
     });
@@ -161,11 +202,12 @@ app.post('/api/transcribe/assemblyai', async (req, res) => {
 
     res.json({ success: true, transcriptId: submitData.id, status: 'processing' });
   } catch (error) {
-    console.error('AssemblyAI error:', error);
+    console.error('Transcription error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+// AssemblyAI durumu kontrol et
 app.get('/api/transcribe/assemblyai/:id', async (req, res) => {
   try {
     const { apiKey } = req.query;
@@ -176,7 +218,7 @@ app.get('/api/transcribe/assemblyai/:id', async (req, res) => {
     });
 
     const data = await response.json();
-    console.log('AssemblyAI status:', data.status, data.error);
+    console.log('AssemblyAI status:', data.status, data.error || '');
     
     if (data.status === 'completed') {
       res.json({ success: true, status: 'completed', transcript: data.text });
