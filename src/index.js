@@ -21,14 +21,17 @@ app.use(express.json({ limit: '50mb' }));
 // Database init
 async function initDB() {
   try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS posts (id SERIAL PRIMARY KEY, title VARCHAR(500) NOT NULL, slug VARCHAR(500) UNIQUE NOT NULL, content TEXT NOT NULL, category VARCHAR(100) DEFAULT 'Genel', excerpt TEXT, thumbnail VARCHAR(500), date VARCHAR(100), read_time VARCHAR(50), status VARCHAR(20) DEFAULT 'draft', scheduled_at TIMESTAMP, published_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS posts (id SERIAL PRIMARY KEY, title VARCHAR(500) NOT NULL, slug VARCHAR(500) UNIQUE NOT NULL, content TEXT NOT NULL, category VARCHAR(100) DEFAULT 'Genel', excerpt TEXT, thumbnail VARCHAR(500), date VARCHAR(100), read_time VARCHAR(50), status VARCHAR(20) DEFAULT 'draft', scheduled_at TIMESTAMP, published_at TIMESTAMP, video_id VARCHAR(50), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS settings (key VARCHAR(100) PRIMARY KEY, value TEXT)`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS youtube_videos (id VARCHAR(50) PRIMARY KEY, title VARCHAR(500), description TEXT, thumbnail VARCHAR(500), duration INTEGER, view_count INTEGER, published_at TIMESTAMP, channel_id VARCHAR(50), video_type VARCHAR(20) DEFAULT 'video', audio_url TEXT, audio_status VARCHAR(20) DEFAULT 'pending', transcript TEXT, transcript_status VARCHAR(20) DEFAULT 'pending', transcript_job_id VARCHAR(100), transcript_model VARCHAR(50), transcript_updated_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS youtube_videos (id VARCHAR(50) PRIMARY KEY, title VARCHAR(500), description TEXT, thumbnail VARCHAR(500), duration INTEGER, view_count INTEGER, published_at TIMESTAMP, channel_id VARCHAR(50), video_type VARCHAR(20) DEFAULT 'video', audio_url TEXT, audio_status VARCHAR(20) DEFAULT 'pending', transcript TEXT, transcript_status VARCHAR(20) DEFAULT 'pending', transcript_job_id VARCHAR(100), transcript_model VARCHAR(50), transcript_updated_at TIMESTAMP, blog_created BOOLEAN DEFAULT FALSE, blog_post_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS allowed_users (id SERIAL PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL, name VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS audio_url TEXT`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS audio_status VARCHAR(20) DEFAULT 'pending'`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS transcript_job_id VARCHAR(100)`);
+    await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS blog_created BOOLEAN DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS blog_post_id INTEGER`);
+    await pool.query(`ALTER TABLE posts ADD COLUMN IF NOT EXISTS video_id VARCHAR(50)`);
     
     await pool.query(`INSERT INTO settings (key, value) VALUES ('autopilot', 'false') ON CONFLICT (key) DO NOTHING`);
     await pool.query(`INSERT INTO settings (key, value) VALUES ('transcription_provider', 'openai') ON CONFLICT (key) DO NOTHING`);
@@ -125,6 +128,15 @@ app.put('/api/youtube/videos/:id/transcript', async (req, res) => {
   } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// Mark video as blog created
+app.put('/api/youtube/videos/:id/blog-created', async (req, res) => {
+  try {
+    const { blogPostId } = req.body;
+    await pool.query(`UPDATE youtube_videos SET blog_created = TRUE, blog_post_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [blogPostId, req.params.id]);
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // =====================
 // TRANSCRIPTION via Audio Processor Service
 // =====================
@@ -212,6 +224,76 @@ app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
         );
       }
     })();
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Bulk transcribe multiple videos
+app.post('/api/youtube/videos/bulk-transcribe', async (req, res) => {
+  try {
+    const { videoIds, apiKey, provider } = req.body;
+    if (!videoIds || !Array.isArray(videoIds)) return res.status(400).json({ error: 'videoIds array required' });
+    if (!apiKey) return res.status(400).json({ error: 'apiKey required' });
+    
+    let transcriptionProvider = provider;
+    if (!transcriptionProvider) {
+      const settingsResult = await pool.query("SELECT value FROM settings WHERE key = 'transcription_provider'");
+      transcriptionProvider = settingsResult.rows[0]?.value || 'openai';
+    }
+    
+    // Start transcription for each video
+    for (const videoId of videoIds) {
+      await pool.query(`UPDATE youtube_videos SET transcript_status = 'processing', audio_status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
+      
+      // Fire and forget - each transcription runs in background
+      (async () => {
+        try {
+          console.log(`🎙️ Bulk: Starting transcription for ${videoId}...`);
+          
+          const transcribeResponse = await fetch(`${AUDIO_PROCESSOR_URL}/transcribe`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ videoId, provider: transcriptionProvider, apiKey, language: 'tr' })
+          });
+          
+          const transcribeData = await transcribeResponse.json();
+          if (!transcribeData.success) throw new Error(transcribeData.error);
+          
+          const jobId = transcribeData.jobId;
+          await pool.query(`UPDATE youtube_videos SET transcript_job_id = $1 WHERE id = $2`, [jobId, videoId]);
+          
+          // Poll for result
+          let completed = false;
+          let attempts = 0;
+          
+          while (!completed && attempts < 120) {
+            await new Promise(r => setTimeout(r, 5000));
+            attempts++;
+            
+            const statusResponse = await fetch(`${AUDIO_PROCESSOR_URL}/status/${jobId}`);
+            const statusData = await statusResponse.json();
+            
+            if (statusData.status === 'completed') {
+              completed = true;
+              await pool.query(`UPDATE youtube_videos SET audio_status = 'completed', transcript = $1, transcript_status = 'completed', transcript_model = $2, transcript_updated_at = CURRENT_TIMESTAMP WHERE id = $3`, [statusData.transcript, transcriptionProvider, videoId]);
+              console.log(`✅ Bulk: Transcription completed for ${videoId}`);
+            } else if (statusData.status === 'failed') {
+              throw new Error(statusData.error);
+            } else if (statusData.status === 'transcribing') {
+              await pool.query(`UPDATE youtube_videos SET audio_status = 'completed' WHERE id = $1`, [videoId]);
+            }
+          }
+          
+          if (!completed) throw new Error('Timeout');
+        } catch (error) {
+          console.error(`❌ Bulk: Failed for ${videoId}:`, error.message);
+          await pool.query(`UPDATE youtube_videos SET transcript_status = 'failed', audio_status = CASE WHEN audio_status = 'processing' THEN 'failed' ELSE audio_status END WHERE id = $1`, [videoId]);
+        }
+      })();
+    }
+    
+    res.json({ success: true, count: videoIds.length, status: 'processing' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -317,11 +399,17 @@ app.get('/api/posts/:slug', async (req, res) => {
 
 app.post('/api/posts', async (req, res) => {
   try {
-    const { title, content, category, excerpt, thumbnail, status } = req.body;
+    const { title, content, category, excerpt, thumbnail, status, videoId } = req.body;
     if (!title || !content) return res.status(400).json({ error: 'Title and content required' });
     const slug = generateSlug(title) + '-' + Date.now();
     const postStatus = status || 'draft';
-    const result = await pool.query(`INSERT INTO posts (title, slug, content, category, excerpt, thumbnail, date, read_time, status, published_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`, [title, slug, content, category || 'Genel', excerpt || content.substring(0, 150) + '...', thumbnail || '', formatDateTR(), calculateReadTime(content), postStatus, postStatus === 'published' ? new Date() : null]);
+    const result = await pool.query(`INSERT INTO posts (title, slug, content, category, excerpt, thumbnail, date, read_time, status, published_at, video_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`, [title, slug, content, category || 'Genel', excerpt || content.substring(0, 150) + '...', thumbnail || '', formatDateTR(), calculateReadTime(content), postStatus, postStatus === 'published' ? new Date() : null, videoId || null]);
+    
+    // Mark video as blog created
+    if (videoId) {
+      await pool.query(`UPDATE youtube_videos SET blog_created = TRUE, blog_post_id = $1 WHERE id = $2`, [result.rows[0].id, videoId]);
+    }
+    
     res.status(201).json({ success: true, post: formatPost(result.rows[0]) });
   } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -378,14 +466,20 @@ app.put('/api/posts/:id', async (req, res) => {
 
 app.delete('/api/posts/:id', async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM posts WHERE id = $1 RETURNING title', [req.params.id]);
+    const result = await pool.query('DELETE FROM posts WHERE id = $1 RETURNING title, video_id', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
+    
+    // Reset blog_created flag on video
+    if (result.rows[0].video_id) {
+      await pool.query(`UPDATE youtube_videos SET blog_created = FALSE, blog_post_id = NULL WHERE id = $1`, [result.rows[0].video_id]);
+    }
+    
     res.json({ success: true, deleted: result.rows[0].title });
   } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
 });
 
 function formatPost(row) {
-  return { id: row.id.toString(), title: row.title, slug: row.slug, content: row.content, category: row.category, excerpt: row.excerpt, thumbnail: row.thumbnail, date: row.date, readTime: row.read_time, status: row.status, scheduledAt: row.scheduled_at, publishedAt: row.published_at, createdAt: row.created_at, updatedAt: row.updated_at };
+  return { id: row.id.toString(), title: row.title, slug: row.slug, content: row.content, category: row.category, excerpt: row.excerpt, thumbnail: row.thumbnail, date: row.date, readTime: row.read_time, status: row.status, scheduledAt: row.scheduled_at, publishedAt: row.published_at, videoId: row.video_id, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
 app.listen(PORT, async () => {
