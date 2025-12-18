@@ -29,6 +29,37 @@ async function initDB() {
     await pool.query(`CREATE TABLE IF NOT EXISTS youtube_videos (id VARCHAR(50) PRIMARY KEY, title VARCHAR(500), description TEXT, thumbnail VARCHAR(500), duration INTEGER, view_count INTEGER, published_at TIMESTAMP, channel_id VARCHAR(50), video_type VARCHAR(20) DEFAULT 'video', audio_url TEXT, audio_status VARCHAR(20) DEFAULT 'pending', transcript TEXT, transcript_status VARCHAR(20) DEFAULT 'pending', transcript_job_id VARCHAR(100), transcript_model VARCHAR(50), transcript_updated_at TIMESTAMP, blog_created BOOLEAN DEFAULT FALSE, blog_post_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS allowed_users (id SERIAL PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL, name VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     
+    // Carousel posts table for Instagram
+    await pool.query(`CREATE TABLE IF NOT EXISTS carousel_posts (
+      id SERIAL PRIMARY KEY,
+      title VARCHAR(500) NOT NULL,
+      week_start DATE,
+      week_end DATE,
+      status VARCHAR(20) DEFAULT 'draft',
+      cover_image_url TEXT,
+      cover_image_prompt TEXT,
+      slides JSONB DEFAULT '[]',
+      raw_news JSONB DEFAULT '[]',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      published_at TIMESTAMP
+    )`);
+    
+    // News items table for carousel content
+    await pool.query(`CREATE TABLE IF NOT EXISTS news_items (
+      id SERIAL PRIMARY KEY,
+      category VARCHAR(100) NOT NULL,
+      title VARCHAR(500) NOT NULL,
+      summary TEXT,
+      source_url TEXT,
+      source_name VARCHAR(100),
+      emoji VARCHAR(10),
+      news_date DATE,
+      is_used BOOLEAN DEFAULT FALSE,
+      carousel_id INTEGER REFERENCES carousel_posts(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS audio_url TEXT`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS audio_status VARCHAR(20) DEFAULT 'pending'`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS transcript_job_id VARCHAR(100)`);
@@ -65,6 +96,293 @@ function parseDuration(d) {
 async function getSetting(key) {
   const result = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
   return result.rows[0]?.value || null;
+}
+
+// =====================
+// DEMO NEWS API - Sahte göçmenlik haberleri
+// =====================
+function generateDemoNews() {
+  const today = new Date();
+  const weekStart = new Date(today);
+  weekStart.setDate(today.getDate() - today.getDay() + 1); // Monday
+  const weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekStart.getDate() + 6); // Sunday
+  
+  const formatDate = (d) => `${d.getDate()} ${['Ocak','Şubat','Mart','Nisan','Mayıs','Haziran','Temmuz','Ağustos','Eylül','Ekim','Kasım','Aralık'][d.getMonth()]}`;
+  
+  return {
+    weekRange: `${formatDate(weekStart)} - ${formatDate(weekEnd)} ${today.getFullYear()}`,
+    weekStart: weekStart.toISOString().split('T')[0],
+    weekEnd: weekEnd.toISOString().split('T')[0],
+    categories: [
+      {
+        name: "Oturma İzni",
+        emoji: "🏠",
+        news: [
+          {
+            title: "Kısa dönem oturma izni başvurularında yeni düzenleme yapıldı.",
+            source: "GİB",
+            url: "https://goc.gov.tr"
+          },
+          {
+            title: "İstanbul'da oturma izni randevu sistemi güncellendi.",
+            source: "İl Göç",
+            url: "https://istanbul.goc.gov.tr"
+          },
+          {
+            title: "Aile ikamet izni için gerekli belgeler listesi yenilendi.",
+            source: "GİB",
+            url: "https://goc.gov.tr"
+          }
+        ]
+      },
+      {
+        name: "Çalışma İzni",
+        emoji: "💼",
+        news: [
+          {
+            title: "Yabancı çalışanlar için yeni istihdam teşviki açıklandı.",
+            source: "ÇSGB",
+            url: "https://csgb.gov.tr"
+          },
+          {
+            title: "Bağımsız çalışma izni başvuru süreci kolaylaştırıldı.",
+            source: "ÇSGB",
+            url: "https://csgb.gov.tr"
+          },
+          {
+            title: "Turkuaz Kart sahipleri için yeni haklar tanımlandı.",
+            source: "Resmi Gazete",
+            url: "https://resmigazete.gov.tr"
+          }
+        ]
+      },
+      {
+        name: "Vatandaşlık",
+        emoji: "🇹🇷",
+        news: [
+          {
+            title: "Yatırım yoluyla vatandaşlık için dolar kuru güncellendi.",
+            source: "Nüfus",
+            url: "https://nvi.gov.tr"
+          },
+          {
+            title: "Olağanüstü vatandaşlık başvuruları hızlandırılıyor.",
+            source: "İçişleri",
+            url: "https://icisleri.gov.tr"
+          }
+        ]
+      },
+      {
+        name: "Vize",
+        emoji: "✈️",
+        news: [
+          {
+            title: "Schengen vize randevuları için yeni dönem başlıyor.",
+            source: "Konsolosluk",
+            url: "https://vfs.com"
+          },
+          {
+            title: "Türkiye-Rusya arasında vizesiz seyahat süresi uzatıldı.",
+            source: "Dışişleri",
+            url: "https://mfa.gov.tr"
+          },
+          {
+            title: "E-Vize sistemine yeni ülkeler eklendi.",
+            source: "E-Vize",
+            url: "https://evisa.gov.tr"
+          }
+        ]
+      },
+      {
+        name: "Genel",
+        emoji: "📢",
+        news: [
+          {
+            title: "Göç İdaresi online hizmetler portalı yenilendi.",
+            source: "GİB",
+            url: "https://goc.gov.tr"
+          },
+          {
+            title: "Yabancılar için TÜRKSAT uydu TV paketi tanıtıldı.",
+            source: "TÜRKSAT",
+            url: "https://turksat.com.tr"
+          }
+        ]
+      }
+    ]
+  };
+}
+
+// =====================
+// CAROUSEL API ENDPOINTS
+// =====================
+
+// Demo news endpoint - sahte haberler döner
+app.get('/api/carousel/demo-news', (req, res) => {
+  res.json(generateDemoNews());
+});
+
+// Get all carousel posts
+app.get('/api/carousel', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM carousel_posts ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Get single carousel post
+app.get('/api/carousel/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM carousel_posts WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Carousel not found' });
+    res.json(result.rows[0]);
+  } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Create new carousel post
+app.post('/api/carousel', async (req, res) => {
+  try {
+    const { title, week_start, week_end, slides, raw_news, cover_image_prompt } = req.body;
+    const result = await pool.query(
+      `INSERT INTO carousel_posts (title, week_start, week_end, slides, raw_news, cover_image_prompt) 
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [title, week_start, week_end, JSON.stringify(slides || []), JSON.stringify(raw_news || []), cover_image_prompt]
+    );
+    res.status(201).json({ success: true, carousel: result.rows[0] });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// Update carousel post
+app.put('/api/carousel/:id', async (req, res) => {
+  try {
+    const { title, slides, cover_image_url, cover_image_prompt, status } = req.body;
+    const result = await pool.query(
+      `UPDATE carousel_posts SET 
+        title = COALESCE($1, title),
+        slides = COALESCE($2, slides),
+        cover_image_url = COALESCE($3, cover_image_url),
+        cover_image_prompt = COALESCE($4, cover_image_prompt),
+        status = COALESCE($5, status),
+        updated_at = CURRENT_TIMESTAMP,
+        published_at = CASE WHEN $5 = 'published' THEN CURRENT_TIMESTAMP ELSE published_at END
+       WHERE id = $6 RETURNING *`,
+      [title, slides ? JSON.stringify(slides) : null, cover_image_url, cover_image_prompt, status, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Carousel not found' });
+    res.json({ success: true, carousel: result.rows[0] });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// Delete carousel post
+app.delete('/api/carousel/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM carousel_posts WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Generate carousel with OpenAI - webhook for n8n
+app.post('/api/carousel/generate', async (req, res) => {
+  try {
+    const { news_data, openai_content } = req.body;
+    
+    // news_data: raw demo news
+    // openai_content: OpenAI tarafından düzenlenmiş içerik (n8n'den gelecek)
+    
+    if (!news_data) {
+      return res.status(400).json({ error: 'news_data required' });
+    }
+    
+    // Parse OpenAI content if provided
+    let slides = [];
+    if (openai_content) {
+      // OpenAI'dan gelen düzenlenmiş içeriği parse et
+      slides = parseOpenAIContent(openai_content, news_data);
+    } else {
+      // Ham veriden basit slides oluştur
+      slides = createBasicSlides(news_data);
+    }
+    
+    // Save to database
+    const result = await pool.query(
+      `INSERT INTO carousel_posts (title, week_start, week_end, slides, raw_news, cover_image_prompt) 
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [
+        `Göçmenlik Haberleri - ${news_data.weekRange}`,
+        news_data.weekStart,
+        news_data.weekEnd,
+        JSON.stringify(slides),
+        JSON.stringify(news_data),
+        generateCoverPrompt(news_data)
+      ]
+    );
+    
+    res.status(201).json({ 
+      success: true, 
+      carousel: result.rows[0],
+      slides_count: slides.length
+    });
+    
+  } catch (error) { 
+    console.error('Carousel generate error:', error);
+    res.status(500).json({ error: error.message }); 
+  }
+});
+
+// Helper: Parse OpenAI content into slides
+function parseOpenAIContent(content, rawNews) {
+  const slides = [];
+  
+  // Slide 1: Cover
+  slides.push({
+    type: 'cover',
+    title: 'Türkiye Göçmenlik Haberleri',
+    subtitle: rawNews.weekRange,
+    brand: 'ATASA',
+    image_placeholder: true // Gemini API için yer tutucu
+  });
+  
+  // Slide 2: Introduction
+  slides.push({
+    type: 'intro',
+    greeting: 'Merhaba,',
+    content: `Bu hafta Göçmenlik Haberleri serisinde, Türkiye'deki göçmenlik mevzuatı ve uygulamalarındaki son gelişmeleri sizin için derledik.\n\nOturma izni düzenlemelerinden çalışma izni kolaylıklarına, vatandaşlık güncellemelerinden vize haberlerine kadar bu sayıda haberdar olmanız gereken birçok yeni gelişme sizi bekliyor.\n\nKeyifli okumalar ☕`,
+    brand: 'ATASA'
+  });
+  
+  // Category slides
+  rawNews.categories.forEach(cat => {
+    slides.push({
+      type: 'category',
+      emoji: cat.emoji,
+      category: cat.name,
+      items: cat.news.map(n => ({
+        text: n.title,
+        source: n.source,
+        url: n.url
+      })),
+      brand: 'ATASA'
+    });
+  });
+  
+  return slides;
+}
+
+// Helper: Create basic slides from raw news
+function createBasicSlides(rawNews) {
+  return parseOpenAIContent(null, rawNews);
+}
+
+// Helper: Generate cover image prompt for Gemini
+function generateCoverPrompt(news) {
+  return `Minimalist black and white illustration for Instagram carousel cover. 
+Theme: Immigration and travel in Turkey. 
+Style: Clean line art, similar to modern editorial illustrations.
+Elements: Two people - one holding documents/passport, another with a suitcase or looking at a phone.
+Text space needed at bottom for title.
+No text in the image itself.
+Professional, friendly, and approachable mood.`;
 }
 
 // =====================
