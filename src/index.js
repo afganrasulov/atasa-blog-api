@@ -23,7 +23,6 @@ async function initDB() {
     await pool.query(`CREATE TABLE IF NOT EXISTS youtube_videos (id VARCHAR(50) PRIMARY KEY, title VARCHAR(500), description TEXT, thumbnail VARCHAR(500), duration INTEGER, view_count INTEGER, published_at TIMESTAMP, channel_id VARCHAR(50), video_type VARCHAR(20) DEFAULT 'video', audio_url TEXT, audio_status VARCHAR(20) DEFAULT 'pending', transcript TEXT, transcript_status VARCHAR(20) DEFAULT 'pending', transcript_job_id VARCHAR(100), transcript_model VARCHAR(50), transcript_updated_at TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS allowed_users (id SERIAL PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL, name VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     
-    // Add new columns if they don't exist
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS audio_url TEXT`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS audio_status VARCHAR(20) DEFAULT 'pending'`);
     await pool.query(`ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS transcript_job_id VARCHAR(100)`);
@@ -123,96 +122,180 @@ app.put('/api/youtube/videos/:id/transcript', async (req, res) => {
 });
 
 // =====================
-// AUDIO EXTRACTION
+// AUDIO EXTRACTION - Multiple Methods
 // =====================
 
 async function getYouTubeAudioUrl(videoId) {
   console.log(`🎵 Getting audio URL for: ${videoId}`);
+  const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
   
-  // Yöntem 1: cobalt.tools
+  // Yöntem 1: y2mate.nu API
   try {
-    const cobaltRes = await fetch('https://co.wuk.sh/api/json', {
+    console.log('Trying y2mate...');
+    const analyzeRes = await fetch('https://www.y2mate.nu/api/convert', {
       method: 'POST',
-      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${videoId}`, isAudioOnly: true, aFormat: 'mp3' })
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `url=${encodeURIComponent(youtubeUrl)}&task=download&filetypes=mp3`
     });
-    const cobaltData = await cobaltRes.json();
-    if (cobaltData.url) { console.log('✅ Cobalt success'); return cobaltData.url; }
-  } catch (e) { console.log('Cobalt failed:', e.message); }
+    const data = await analyzeRes.json();
+    if (data.download_url) { 
+      console.log('✅ y2mate success'); 
+      return data.download_url; 
+    }
+  } catch (e) { console.log('y2mate failed:', e.message); }
   
-  // Yöntem 2: vevioz
+  // Yöntem 2: loader.to API
   try {
+    console.log('Trying loader.to...');
+    const loaderRes = await fetch(`https://loader.to/api/button/?url=${encodeURIComponent(youtubeUrl)}&f=mp3`);
+    const html = await loaderRes.text();
+    const match = html.match(/href="(https:\/\/[^"]+)"/);
+    if (match && match[1]) { 
+      console.log('✅ loader.to success'); 
+      return match[1]; 
+    }
+  } catch (e) { console.log('loader.to failed:', e.message); }
+  
+  // Yöntem 3: ssyoutube API
+  try {
+    console.log('Trying ssyoutube...');
+    const ssRes = await fetch(`https://ssyoutube.com/api/convert?url=${encodeURIComponent(youtubeUrl)}`);
+    const ssData = await ssRes.json();
+    if (ssData.url) { 
+      console.log('✅ ssyoutube success'); 
+      return ssData.url; 
+    }
+  } catch (e) { console.log('ssyoutube failed:', e.message); }
+  
+  // Yöntem 4: 9convert
+  try {
+    console.log('Trying 9convert...');
+    const convertRes = await fetch('https://9convert.com/api/ajaxSearch/index', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `query=${encodeURIComponent(youtubeUrl)}&vt=mp3`
+    });
+    const convertData = await convertRes.json();
+    if (convertData.links?.mp3) {
+      const mp3Links = Object.values(convertData.links.mp3);
+      if (mp3Links[0]?.k) {
+        const convertRes2 = await fetch('https://9convert.com/api/ajaxConvert/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: `vid=${convertData.vid}&k=${encodeURIComponent(mp3Links[0].k)}`
+        });
+        const convertData2 = await convertRes2.json();
+        if (convertData2.dlink) {
+          console.log('✅ 9convert success');
+          return convertData2.dlink;
+        }
+      }
+    }
+  } catch (e) { console.log('9convert failed:', e.message); }
+  
+  // Yöntem 5: yt1s
+  try {
+    console.log('Trying yt1s...');
+    const yt1sRes = await fetch('https://www.yt1s.com/api/ajaxSearch/index', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `q=${encodeURIComponent(youtubeUrl)}&vt=mp3`
+    });
+    const yt1sData = await yt1sRes.json();
+    if (yt1sData.links?.mp3) {
+      const mp3Links = Object.values(yt1sData.links.mp3);
+      if (mp3Links[0]?.k) {
+        const yt1sRes2 = await fetch('https://www.yt1s.com/api/ajaxConvert/convert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: `vid=${yt1sData.vid}&k=${encodeURIComponent(mp3Links[0].k)}`
+        });
+        const yt1sData2 = await yt1sRes2.json();
+        if (yt1sData2.dlink) {
+          console.log('✅ yt1s success');
+          return yt1sData2.dlink;
+        }
+      }
+    }
+  } catch (e) { console.log('yt1s failed:', e.message); }
+
+  // Yöntem 6: vevioz (eski)
+  try {
+    console.log('Trying vevioz...');
     const analyzeRes = await fetch(`https://api.vevioz.com/api/button/mp3/${videoId}`);
     const html = await analyzeRes.text();
     const match = html.match(/href="(https:\/\/[^"]+\.mp3[^"]*)"/);
     if (match) { console.log('✅ Vevioz success'); return match[1]; }
   } catch (e) { console.log('Vevioz failed:', e.message); }
   
-  throw new Error('Ses URL alınamadı');
+  // Yöntem 7: mp3download.to
+  try {
+    console.log('Trying mp3download.to...');
+    const mp3Res = await fetch(`https://mp3download.to/api/v1/download?url=${encodeURIComponent(youtubeUrl)}`);
+    const mp3Data = await mp3Res.json();
+    if (mp3Data.downloadUrl) {
+      console.log('✅ mp3download.to success');
+      return mp3Data.downloadUrl;
+    }
+  } catch (e) { console.log('mp3download.to failed:', e.message); }
+  
+  throw new Error('Tüm audio extraction yöntemleri başarısız oldu');
 }
 
-// MP3'e çevir (audio URL al ve kaydet)
+// MP3'e çevir endpoint
 app.post('/api/youtube/videos/:id/extract-audio', async (req, res) => {
   try {
     const videoId = req.params.id;
     
-    // Durumu "processing" yap
     await pool.query(`UPDATE youtube_videos SET audio_status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
-    
-    // Hemen response dön, işlem arka planda devam etsin
     res.json({ success: true, status: 'processing' });
     
-    // Arka planda audio URL al
-    try {
-      const audioUrl = await getYouTubeAudioUrl(videoId);
-      await pool.query(`UPDATE youtube_videos SET audio_url = $1, audio_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [audioUrl, videoId]);
-      console.log(`✅ Audio extracted for ${videoId}`);
-    } catch (error) {
-      await pool.query(`UPDATE youtube_videos SET audio_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
-      console.error(`❌ Audio extraction failed for ${videoId}:`, error.message);
-    }
+    (async () => {
+      try {
+        const audioUrl = await getYouTubeAudioUrl(videoId);
+        await pool.query(`UPDATE youtube_videos SET audio_url = $1, audio_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [audioUrl, videoId]);
+        console.log(`✅ Audio extracted for ${videoId}`);
+      } catch (error) {
+        await pool.query(`UPDATE youtube_videos SET audio_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
+        console.error(`❌ Audio extraction failed for ${videoId}:`, error.message);
+      }
+    })();
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
 // =====================
-// TRANSCRIPTION (Background Job)
+// TRANSCRIPTION
 // =====================
 
-// Transkripsiyon başlat (arka planda çalışır)
 app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
   try {
     const videoId = req.params.id;
     const { apiKey } = req.body;
     if (!apiKey) return res.status(400).json({ error: 'apiKey required' });
     
-    // Video bilgisini al
     const videoResult = await pool.query('SELECT * FROM youtube_videos WHERE id = $1', [videoId]);
     if (videoResult.rows.length === 0) return res.status(404).json({ error: 'Video not found' });
     
     const video = videoResult.rows[0];
     
-    // Durumu "processing" yap
     await pool.query(`UPDATE youtube_videos SET transcript_status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
-    
-    // Hemen response dön
     res.json({ success: true, status: 'processing' });
     
-    // Arka planda işlemi yap
     (async () => {
       try {
-        // Eğer audio URL yoksa önce onu al
         let audioUrl = video.audio_url;
         if (!audioUrl || video.audio_status !== 'completed') {
           console.log(`🎵 Extracting audio for ${videoId}...`);
+          await pool.query(`UPDATE youtube_videos SET audio_status = 'processing' WHERE id = $1`, [videoId]);
           audioUrl = await getYouTubeAudioUrl(videoId);
           await pool.query(`UPDATE youtube_videos SET audio_url = $1, audio_status = 'completed' WHERE id = $2`, [audioUrl, videoId]);
+          console.log(`✅ Audio URL obtained: ${audioUrl.substring(0, 50)}...`);
         }
         
         console.log(`🎙️ Starting transcription for ${videoId}...`);
         
-        // AssemblyAI'a gönder
         const submitResponse = await fetch('https://api.assemblyai.com/v2/transcript', {
           method: 'POST',
           headers: { 'Authorization': apiKey, 'Content-Type': 'application/json' },
@@ -220,6 +303,8 @@ app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
         });
         
         const submitData = await submitResponse.json();
+        console.log('AssemblyAI response:', JSON.stringify(submitData));
+        
         if (submitData.error) throw new Error(submitData.error);
         
         const transcriptId = submitData.id;
@@ -227,15 +312,20 @@ app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
         
         console.log(`📝 Transcript job started: ${transcriptId}`);
         
-        // Polling ile sonucu bekle
         let completed = false;
-        while (!completed) {
-          await new Promise(r => setTimeout(r, 5000)); // 5 saniye bekle
+        let attempts = 0;
+        const maxAttempts = 60; // 5 dakika max
+        
+        while (!completed && attempts < maxAttempts) {
+          await new Promise(r => setTimeout(r, 5000));
+          attempts++;
           
           const checkResponse = await fetch(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
             headers: { 'Authorization': apiKey }
           });
           const checkData = await checkResponse.json();
+          
+          console.log(`Polling ${attempts}: status = ${checkData.status}`);
           
           if (checkData.status === 'completed') {
             completed = true;
@@ -245,9 +335,13 @@ app.post('/api/youtube/videos/:id/transcribe', async (req, res) => {
             throw new Error(checkData.error || 'Transcription failed');
           }
         }
+        
+        if (!completed) {
+          throw new Error('Transcription timeout');
+        }
       } catch (error) {
         console.error(`❌ Transcription failed for ${videoId}:`, error.message);
-        await pool.query(`UPDATE youtube_videos SET transcript_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
+        await pool.query(`UPDATE youtube_videos SET transcript_status = 'failed', audio_status = CASE WHEN audio_status = 'processing' THEN 'failed' ELSE audio_status END, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]);
       }
     })();
   } catch (error) {
