@@ -679,6 +679,7 @@ app.put('/api/youtube/videos/:id/transcript', async (req, res) => { try { const 
 app.put('/api/youtube/videos/:id/blog-created', async (req, res) => { try { const { blogPostId } = req.body; await pool.query(`UPDATE youtube_videos SET blog_created = TRUE, blog_post_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [blogPostId, req.params.id]); res.json({ success: true }); } catch (error) { res.status(500).json({ error: 'Internal server error' }); } });
 app.post('/api/youtube/videos/:id/transcribe', async (req, res) => { try { const videoId = req.params.id; const { apiKey, provider } = req.body; if (!apiKey) return res.status(400).json({ error: 'apiKey required' }); const videoResult = await pool.query('SELECT * FROM youtube_videos WHERE id = $1', [videoId]); if (videoResult.rows.length === 0) return res.status(404).json({ error: 'Video not found' }); let transcriptionProvider = provider || await getSetting('transcription_provider') || 'openai'; res.json({ success: true, status: 'processing', provider: transcriptionProvider }); startTranscription(videoId, apiKey, transcriptionProvider); } catch (error) { res.status(500).json({ error: error.message }); } });
 app.post('/api/youtube/videos/bulk-transcribe', async (req, res) => { try { const { videoIds, apiKey, provider } = req.body; if (!videoIds || !Array.isArray(videoIds)) return res.status(400).json({ error: 'videoIds array required' }); if (!apiKey) return res.status(400).json({ error: 'apiKey required' }); let transcriptionProvider = provider || await getSetting('transcription_provider') || 'openai'; for (const videoId of videoIds) { startTranscription(videoId, apiKey, transcriptionProvider); } res.json({ success: true, count: videoIds.length, status: 'processing' }); } catch (error) { res.status(500).json({ error: error.message }); } });
+app.post('/api/youtube/videos/reset-failed', async (req, res) => { try { const { videoIds } = req.body; if (!videoIds || !Array.isArray(videoIds)) return res.status(400).json({ error: 'videoIds array required' }); const result = await pool.query(`UPDATE youtube_videos SET transcript_status = 'pending', audio_status = 'pending', audio_url = NULL, transcript_job_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ANY($1::text[]) AND transcript_status = 'failed'`, [videoIds]); res.json({ success: true, reset: result.rowCount }); } catch (error) { res.status(500).json({ error: error.message }); } });
 app.post('/api/youtube/videos/:id/extract-audio', async (req, res) => { try { const videoId = req.params.id; await pool.query(`UPDATE youtube_videos SET audio_status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]); res.json({ success: true, status: 'processing' }); (async () => { try { const extractResponse = await fetch(`${AUDIO_PROCESSOR_URL}/extract`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ videoId }) }); const extractData = await extractResponse.json(); if (!extractData.success) throw new Error(extractData.error); const jobId = extractData.jobId; let completed = false, attempts = 0; while (!completed && attempts < 60) { await new Promise(r => setTimeout(r, 5000)); attempts++; const statusResponse = await fetch(`${AUDIO_PROCESSOR_URL}/status/${jobId}`); const statusData = await statusResponse.json(); if (statusData.status === 'completed') { completed = true; const audioUrl = `${AUDIO_PROCESSOR_URL}/audio/${videoId}`; await pool.query(`UPDATE youtube_videos SET audio_url = $1, audio_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [audioUrl, videoId]); console.log(`✅ Audio extracted for ${videoId}`); } else if (statusData.status === 'failed') { throw new Error(statusData.error); } } if (!completed) throw new Error('Audio extraction timeout'); } catch (error) { await pool.query(`UPDATE youtube_videos SET audio_status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [videoId]); console.error(`❌ Audio extraction failed for ${videoId}:`, error.message); } })(); } catch (error) { res.status(500).json({ error: error.message }); } });
 
 // ===================== SETTINGS =====================
@@ -696,6 +697,45 @@ app.put('/api/posts/:id/schedule', async (req, res) => { try { const { scheduled
 app.put('/api/posts/:id/unpublish', async (req, res) => { try { const result = await pool.query(`UPDATE blog_posts SET status = 'draft', is_published = false, published_at = NULL, scheduled_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *`, [req.params.id]); if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' }); res.json({ success: true, post: formatPost(result.rows[0]) }); } catch (error) { res.status(500).json({ error: 'Internal server error' }); } });
 app.put('/api/posts/:id', async (req, res) => { try { const { title, content, category, excerpt, thumbnail, status, author, metaDescription, focusKeyword } = req.body; const existing = await pool.query('SELECT * FROM blog_posts WHERE id = $1', [req.params.id]); if (existing.rows.length === 0) return res.status(404).json({ error: 'Post not found' }); const post = existing.rows[0]; const newStatus = status || post.status; const result = await pool.query(`UPDATE blog_posts SET title = $1, content = $2, category = $3, excerpt = $4, cover_image = $5, read_time = $6, status = $7, is_published = $8, author = $9, meta_description = $10, focus_keyword = $11, updated_at = CURRENT_TIMESTAMP WHERE id = $12 RETURNING *`, [title || post.title, content || post.content, category || post.category, excerpt || post.excerpt, thumbnail || post.cover_image, content ? calculateReadTime(content) : post.read_time, newStatus, newStatus === 'published', author || post.author, metaDescription || post.meta_description, focusKeyword || post.focus_keyword, req.params.id]); res.json({ success: true, post: formatPost(result.rows[0]) }); } catch (error) { res.status(500).json({ error: 'Internal server error' }); } });
 app.delete('/api/posts/:id', async (req, res) => { try { const result = await pool.query('DELETE FROM blog_posts WHERE id = $1 RETURNING title, video_id', [req.params.id]); if (result.rows.length === 0) return res.status(404).json({ error: 'Post not found' }); if (result.rows[0].video_id) { await pool.query(`UPDATE youtube_videos SET blog_created = FALSE, blog_post_id = NULL WHERE id = $1`, [result.rows[0].video_id]); } res.json({ success: true, deleted: result.rows[0].title }); } catch (error) { res.status(500).json({ error: 'Internal server error' }); } });
+
+// ===================== SITEMAP =====================
+function getSiteUrl(req) {
+  const referer = req.get('referer') || '';
+  const host = req.query.host || '';
+  if (referer.includes('atasa.tr') || host.includes('atasa.tr')) return 'https://atasa.tr';
+  return 'https://atasa.mobi';
+}
+
+app.get('/sitemap_index.xml', (req, res) => {
+  const S = getSiteUrl(req);
+  res.set('Content-Type', 'application/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <sitemap><loc>${S}/sitemap-pages.xml</loc></sitemap>\n  <sitemap><loc>${S}/sitemap-blog.xml</loc></sitemap>\n</sitemapindex>`);
+});
+
+app.get('/sitemap-pages.xml', (req, res) => {
+  const S = getSiteUrl(req);
+  res.set('Content-Type', 'application/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${S}/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>\n  <url><loc>${S}/blog</loc><changefreq>daily</changefreq><priority>0.9</priority></url>\n  <url><loc>${S}/hakkimizda</loc><changefreq>monthly</changefreq><priority>0.7</priority></url>\n  <url><loc>${S}/iletisim</loc><changefreq>monthly</changefreq><priority>0.7</priority></url>\n  <url><loc>${S}/hizmetler</loc><changefreq>monthly</changefreq><priority>0.8</priority></url>\n</urlset>`);
+});
+
+app.get('/sitemap-blog.xml', async (req, res) => {
+  try {
+    const S = getSiteUrl(req);
+    const posts = await pool.query("SELECT slug, updated_at, published_at FROM blog_posts WHERE is_published = true ORDER BY published_at DESC");
+    const urls = posts.rows.map(p => {
+      const lastmod = (p.updated_at || p.published_at || new Date()).toISOString().split('T')[0];
+      return `  <url><loc>${S}/blog/${p.slug}</loc><lastmod>${lastmod}</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>`;
+    }).join('\n');
+    res.set('Content-Type', 'application/xml');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>`);
+  } catch (error) { res.status(500).send('Error generating sitemap'); }
+});
+
+app.get('/robots.txt', (req, res) => {
+  const S = getSiteUrl(req);
+  res.set('Content-Type', 'text/plain');
+  res.send(`User-agent: *\nAllow: /\nSitemap: ${S}/sitemap_index.xml`);
+});
 
 function formatPost(row) { return { id: row.id.toString(), title: row.title, slug: row.slug, content: row.content, category: row.category, excerpt: row.excerpt, thumbnail: row.cover_image || row.thumbnail, coverImage: row.cover_image, tags: row.tags, author: row.author, readTime: row.read_time, status: row.status, isPublished: row.is_published, scheduledAt: row.scheduled_at, publishedAt: row.published_at, videoId: row.video_id, metaDescription: row.meta_description, focusKeyword: row.focus_keyword, schemaType: row.schema_type, createdAt: row.created_at, updatedAt: row.updated_at }; }
 
