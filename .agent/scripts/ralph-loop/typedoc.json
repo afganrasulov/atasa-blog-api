@@ -1,0 +1,17 @@
+{
+    "$schema": "https://typedoc.org/schema.json",
+    "entryPoints": [
+        "src/index.ts"
+    ],
+    "out": "docs",
+    "name": "Ralph Loop CLI",
+    "readme": "none",
+    "tsconfig": "./tsconfig.json",
+    "excludePrivate": false,
+    "excludeProtected": false,
+    "includeVersion": true,
+    "categorizeByGroup": true,
+    "navigationLinks": {
+        "GitHub": "https://github.com/afganrasulov/atasa-admin"
+    }
+}

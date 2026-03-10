@@ -1,0 +1,4 @@
+# Agent Progress Tracker
+# Bu dosya agent'ın görev durumunu takip eder.
+# Görev tamamlandığında bitiş sinyali buraya yazılır.
+# Format: <promise>task-complete-{random}</promise>
